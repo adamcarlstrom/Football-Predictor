@@ -212,4 +212,14 @@ target_path = os.path.join(script_dir, '../backend/match_predictor.joblib')
 joblib.dump(model, target_path)
 print("Complete! The model 'match_predictor.joblib' is now ready in the backend.")
 
+# --- 7. SAVE FINAL ELO RATINGS TO DATABASE ---
+print("7. Pushing latest ELO ratings to Supabase...")
 
+# Iterate through our ledger and update the Teams table
+for team_id, stats in team_stats.items():
+    final_elo = round(stats['elo'], 2) # Round to 2 decimals for clean data
+    
+    # Update the team's row with their new ELO rating
+    supabase.table("Teams").update({"current_elo": final_elo}).eq("team_id", team_id).execute()
+
+print("ELO sync complete! The backend now has live access to team strengths.")

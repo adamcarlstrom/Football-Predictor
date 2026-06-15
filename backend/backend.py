@@ -1,6 +1,7 @@
 import os
 import requests
 import pandas as pd
+import joblib
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
@@ -16,6 +17,16 @@ FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY")
 
 # Initialize Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+try:
+    # Get the absolute path to where backend.py lives
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    model_path = os.path.join(BASE_DIR, 'match_predictor.joblib')
+    ml_model = joblib.load(model_path)
+    print("Machine Learning Model loaded successfully!")
+except Exception as e:
+    print(f"Warning: Could not load ML model. {e}")
+    ml_model = None
 
 app = FastAPI(title="Football Prediction Portfolio API")
 
@@ -71,7 +82,8 @@ def fetch_and_predict(match_id: int):
         "away_team_id": fixture_info["teams"]["away"]["id"],
         "away_team_name": fixture_info["teams"]["away"]["name"],
         "away_team_logo": fixture_info["teams"]["away"]["logo"],
-        "status": fixture_info["fixture"]["status"]["short"] # e.g., 'NS' for Not Started
+        "status": fixture_info["fixture"]["status"]["short"], # e.g., 'NS' for Not Started
+        "league_name": fixture_info["league"]["name"]
     }
 
     # 3. Cache the teams in Supabase if they don't exist yet to avoid foreign key violations
@@ -95,18 +107,101 @@ def fetch_and_predict(match_id: int):
     # 5. Placeholder Baseline ML Logic
     # Right now, we will simulate a baseline prediction (e.g., 40% Home Win, 30% Draw, 30% Away Win)
     # This will be replaced by your real scikit-learn model once you train it on historical data.
+    if ml_model is None:
+        raise HTTPException(status_code=500, detail="ML Model is offline.")
+
+    home_id = match_details["home_team_id"]
+    away_id = match_details["away_team_id"]
+    match_date = match_details["date"]
+
+    # HELPER: Quick function to get a team's last 5 matches from Supabase
+    def get_live_team_stats(team_id):
+        # Query the database for the last 5 matches this team played BEFORE today
+        res = supabase.table("Matches").select("*").or_(f"home_team_id.eq.{team_id},away_team_id.eq.{team_id}").lt("date", match_date).order("date", desc=True).limit(5).execute()
+        
+        matches = res.data
+        if not matches:
+            return {"win_rate": 0.0, "gd": 0.0, "rest_days": 14}
+            
+        wins = 0
+        goals_for = 0
+        goals_against = 0
+        
+        for m in matches:
+            is_home = m["home_team_id"] == team_id
+            team_goals = m["home_goals"] if is_home else m["away_goals"]
+            opp_goals = m["away_goals"] if is_home else m["home_goals"]
+            
+            # Count goals (if not null)
+            if team_goals is not None and opp_goals is not None:
+                goals_for += team_goals
+                goals_against += opp_goals
+                
+                # Count wins
+                if m["status"] != 'PEN':
+                    if team_goals > opp_goals:
+                        wins += 1
+                else:
+                    if m["match_winner_id"] == team_id:
+                        wins += 1
+                        
+        win_rate = wins / len(matches)
+        gd = (goals_for - goals_against) / len(matches)
+        
+        # Calculate rest days
+        last_match_date = pd.to_datetime(matches[0]["date"])
+        current_date = pd.to_datetime(match_date)
+        rest_days = min(abs((current_date - last_match_date).days), 14)
+        
+        return {"win_rate": win_rate, "gd": gd, "rest_days": rest_days}
+
+    # Fetch live stats for both teams
+    home_stats = get_live_team_stats(home_id)
+    away_stats = get_live_team_stats(away_id)
+    
+    home_team_data = supabase.table("Teams").select("current_elo").eq("team_id", home_id).single().execute()
+    away_team_data = supabase.table("Teams").select("current_elo").eq("team_id", away_id).single().execute()
+    
+    # Default to 1500 if the database fetch fails or the column is empty
+    home_elo = home_team_data.data.get("current_elo") or 1500.0
+    away_elo = away_team_data.data.get("current_elo") or 1500.0
+
+    # Construct the 5 features exactly as the model expects them
+    live_home_win_rate_diff = home_stats["win_rate"] - away_stats["win_rate"]
+    live_home_gd_diff = home_stats["gd"] - away_stats["gd"]
+    live_rest_days_diff = home_stats["rest_days"] - away_stats["rest_days"]
+    live_elo_diff = home_elo - away_elo 
+    
+    # Simple importance mapping for the live match
+    league_name = match_details["league_name"]
+    if league_name == "World Cup": live_importance = 3
+    elif league_name in ["Euro Championship", "Copa America", "Africa Cup of Nations", "Asian Cup"]: live_importance = 2
+    elif league_name == "UEFA Nations League": live_importance = 2
+    else: live_importance = 1
+
+    # Create the input array (MUST MATCH THE EXACT ORDER OF YOUR TRAINING SCRIPT)
+    X_live = pd.DataFrame([{
+        'home_win_rate_diff': live_home_win_rate_diff,
+        'home_gd_diff': live_home_gd_diff,
+        'elo_diff': live_elo_diff,
+        'rest_days_diff': live_rest_days_diff,
+        'match_importance': live_importance
+    }])
+
+    # Ask the Random Forest for the probabilities!
+    probabilities = ml_model.predict_proba(X_live)[0]
+
+    # Map the probabilities to the database payload
     prediction_data = {
         "match_id": match_details["match_id"],
-        "home_win_prob": 0.4000,
-        "draw_prob": 0.3000,
-        "away_win_prob": 0.3000
+        "home_win_prob": round(float(probabilities[0]), 4),
+        "draw_prob": round(float(probabilities[1]), 4),
+        "away_win_prob": round(float(probabilities[2]), 4)
     }
     
     # Save the prediction probabilities to Supabase
     supabase.table("Predictions").upsert(prediction_data).execute()
 
-    print("Returning")
-    # 6. Return the finalized payload to your React frontend
     return {
         "match_info": match_details,
         "prediction": prediction_data
