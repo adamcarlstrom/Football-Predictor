@@ -5,7 +5,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from supabase import create_client, Client
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Load environment variables from the .env file
 load_dotenv(override=True)
@@ -115,30 +115,77 @@ def fetch_and_predict(match_id: int):
 @app.get("/api/matches/today")
 def get_todays_matches():
     """
-    Fetches a list of today's fixtures to populate the frontend dropdown menu.
+    Fetches a list of today's fixtures. Checks Supabase first to save API quota.
+    If empty, fetches from API-Football and caches the result in Supabase.
     """
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    url = f"https://v3.football.api-sports.io/fixtures?date={today_str}"
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    start_of_day = f"{today_str}T00:00:00Z"
+    end_of_day = f"{today_str}T23:59:59Z"
     
-    headers = {
-        'x-rapidapi-host': 'v3.football.api-sports.io',
-        'x-rapidapi-key': FOOTBALL_API_KEY
-    }
+    # --- 1. THE CACHE CHECK ---
+    # We ask Supabase for today's matches, and ask it to join the team names
+    db_response = supabase.table("Matches").select(
+        "match_id, home:Teams!home_team_id(name), away:Teams!away_team_id(name)"
+    ).gte("date", start_of_day).lte("date", end_of_day).execute()
     
-    try:
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Failed to fetch daily matches")
-
-    # Clean the data to send just what the dropdown needs
-    available_matches = []
-    for fixture in data.get("response", []):
-        if({fixture['league']['name']} == {'World Cup'}):
+    # If Supabase has the data, return it immediately and STOP here.
+    if db_response.data and len(db_response.data) > 0:
+        print("CACHE HIT: Serving matches from Supabase")
+        available_matches = []
+        for row in db_response.data:
+            home_name = row["home"]["name"] if row.get("home") else "Unknown"
+            away_name = row["away"]["name"] if row.get("away") else "Unknown"
             available_matches.append({
-                "match_id": fixture["fixture"]["id"],
-                "label": f"{fixture['teams']['home']['name']} vs {fixture['teams']['away']['name']} ({fixture['league']['name']})"
+                "match_id": row["match_id"],
+                "label": f"{home_name} vs {away_name}"
             })
+        return {"matches": available_matches}
+    else:
+        print("CACHE MISS: Fetching Matches from API")
+        url = f"https://v3.football.api-sports.io/fixtures?date={today_str}"
         
-    return {"matches": available_matches}
+        headers = {
+            'x-rapidapi-host': 'v3.football.api-sports.io',
+            'x-rapidapi-key': FOOTBALL_API_KEY
+        }
+        
+        try:
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail="Failed to fetch daily matches")
+
+        # --- 3. CACHE THE NEW DATA ---
+        available_matches = []
+        for fixture in data.get("response", []):
+            # print(fixture["league"]["name"])
+            if(fixture["league"]["name"] == 'World Cup'):
+                match_id = fixture["fixture"]["id"]
+                home_team = fixture["teams"]["home"]
+                away_team = fixture["teams"]["away"]
+                
+                # Prepare the label for React
+                available_matches.append({
+                    "match_id": match_id,
+                    "label": f"{home_team['name']} vs {away_team['name']}"
+                })
+                
+                # Save Teams to Supabase
+                for team in [home_team, away_team]:
+                    supabase.table("Teams").upsert({
+                        "team_id": team["id"],
+                        "name": team["name"],
+                        "logo_url": team["logo"]
+                    }).execute()
+
+                # Save Match to Supabase
+                supabase.table("Matches").upsert({
+                    "match_id": match_id,
+                    "date": fixture["fixture"]["date"],
+                    "home_team_id": home_team["id"],
+                    "away_team_id": away_team["id"],
+                    "status": fixture["fixture"]["status"]["short"]
+                }).execute()
+
+        return {"matches": available_matches}
