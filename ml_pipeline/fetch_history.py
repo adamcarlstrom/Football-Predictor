@@ -4,8 +4,7 @@ import requests
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
-# Load environment variables from the backend folder
-load_dotenv(dotenv_path="../backend/.env", override=True)
+load_dotenv(override=True)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -18,27 +17,48 @@ headers = {
     'x-rapidapi-key': FOOTBALL_API_KEY
 }
 
-# Key International League IDs from API-Football
-# 1: World Cup, 4: Euro, 9: Copa America, 10: Friendlies, 2: Champions League (if you expand later)
-TARGET_LEAGUES = [1, 4, 9, 10] 
-SEASONS = [2018, 2019, 2020, 2021, 2022, 2023, 2024]
+# --- THE OPTIMIZED TOURNAMENT MAP ---
+# Only fetch the exact years these tournaments actually took place
+TOURNAMENT_MAP = {
+    1: [2022], # World Cup # 2018, 2026 not available
+    4: [2024], # Euro Championship # 2020 not available
+    5: [2022,2024], # Nations League # only 2022-2024 available
+    6: [2023], # AFCON # 2025 
+    7: [2023] , # Asian CUP
+    9: [2024], # Copa America # 2019, 2021 not available
+    10: [2022, 2023, 2024], # Friendlies (limiting to recent years to save tokens)
+     
+}
 
 def fetch_and_store_season(league_id, season):
     print(f"Fetching League {league_id} for Season {season}...")
     url = f"https://v3.football.api-sports.io/fixtures?league={league_id}&season={season}"
     
     response = requests.get(url, headers=headers)
+    
+    # 1. Check for standard HTTP crashes
     if response.status_code != 200:
-        print(f"Error fetching data: {response.text}")
+        print(f"HTTP Error: {response.text}")
         return
 
-    data = response.json().get("response", [])
+    json_data = response.json()
+    
+    # 2. NEW: Check for API-Football's "Silent Errors" (like rate limits)
+    api_errors = json_data.get("errors")
+    if api_errors:
+        # Sometimes errors is an empty list [], sometimes it's a dict.
+        if isinstance(api_errors, dict) and len(api_errors) > 0:
+            print(f"API SILENT ERROR TRIPPED: {api_errors}")
+            return
+        elif isinstance(api_errors, list) and len(api_errors) > 0:
+            print(f"API SILENT ERROR TRIPPED: {api_errors}")
+            return
+
+    data = json_data.get("response", [])
     print(f"Found {len(data)} matches. Processing...")
 
     for fixture in data:
         status = fixture["fixture"]["status"]["short"]
-        
-        # Only save finished matches for historical training
         if status not in ['FT', 'AET', 'PEN']:
             continue
             
@@ -46,7 +66,6 @@ def fetch_and_store_season(league_id, season):
         away_team = fixture["teams"]["away"]
         score = fixture["score"]["penalty"] if status == 'PEN' else fixture["score"]["fulltime"]
 
-        # 1. Upsert Teams
         for team in [home_team, away_team]:
             supabase.table("Teams").upsert({
                 "team_id": team["id"],
@@ -54,7 +73,6 @@ def fetch_and_store_season(league_id, season):
                 "logo_url": team["logo"]
             }).execute()
 
-        # 2. Determine match winner (if penalties)
         winner_id = None
         if status == 'PEN':
             if fixture["teams"]["home"]["winner"]:
@@ -62,7 +80,6 @@ def fetch_and_store_season(league_id, season):
             elif fixture["teams"]["away"]["winner"]:
                 winner_id = away_team["id"]
 
-        # 3. Upsert Match
         match_payload = {
             "match_id": fixture["fixture"]["id"],
             "date": fixture["fixture"]["date"],
@@ -71,22 +88,19 @@ def fetch_and_store_season(league_id, season):
             "home_goals": score.get("home"),
             "away_goals": score.get("away"),
             "status": status,
-            "match_winner_id": winner_id
-            # Note: Detailed stats like possession require a separate endpoint call per match,
-            # which would burn through your 100/day limit. For MVP ML, goals and results are enough.
+            "match_winner_id": winner_id,
+            "league_name": fixture["league"]["name"]
         }
         
         supabase.table("Matches").upsert(match_payload).execute()
 
     print(f"Finished League {league_id} Season {season}.\n")
 
-# --- MAIN EXECUTION ---
 if __name__ == "__main__":
-    for league in TARGET_LEAGUES:
-        for season in SEASONS:
+    # Loop through our exact, optimized dictionary
+    for league, seasons in TOURNAMENT_MAP.items():
+        for season in seasons:
             fetch_and_store_season(league, season)
-            
-            # CRITICAL: Pause for 7 seconds to respect the 10 requests/minute API limit
             time.sleep(7) 
             
     print("Historical data ingestion complete!")
