@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 
 // 1. Types: We define the shape of the data we expect from the Python backend.
 // This gives us autocomplete and prevents typos.
@@ -16,6 +16,11 @@ interface PredictionData {
   };
 }
 
+interface MatchOption {
+  match_id: number;
+  label: string;
+}
+
 export default function App() {
   // 2. State Hooks: React's memory. 
   // 'matchId' tracks what the user types in the input box.
@@ -25,6 +30,30 @@ export default function App() {
   const [data, setData] = useState<PredictionData | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
+
+  // To hold list of matches
+  const [availableMatches, setAvailableMatches] = useState<MatchOption[]>([]);
+  const [isLoadingMatches, setIsLoadingMatches] = useState<boolean>(true);
+
+  useEffect(() => {
+    const fetchDropdownData = async () => {
+      try {
+        const response = await fetch('http://127.0.0.1:8000/api/matches/today');
+        const result = await response.json();
+        setAvailableMatches(result.matches);
+        // Auto-select the first match in the list if it exists
+        if (result.matches.length > 0) {
+          setMatchId(result.matches[0].match_id.toString());
+        }
+      } catch (err) {
+        console.error("Failed to load matches for dropdown", err);
+      } finally {
+        setIsLoadingMatches(false);
+      }
+    };
+
+    fetchDropdownData();
+  }, []); // The empty array [] means this only runs once on load
 
   // 3. The Action Function: Triggered when the button is clicked.
   const fetchPrediction = async () => {
@@ -64,32 +93,36 @@ export default function App() {
   // It checks the state variables to decide what HTML to show.
   return (
     <div style={{ padding: '40px', fontFamily: 'system-ui, sans-serif', maxWidth: '600px', margin: '0 auto' }}>
-      <h1>Match Predictor Admin Tester</h1>
-      
-      <div style={{ marginBottom: '20px' }}>
-        <input 
-          type="text" 
-          value={matchId}
-          // The onChange event updates the matchId state every time you type a keystroke
+      <h1>Match Predictor</h1>
+      <p>Showing todays matches</p>
+      <div style={{ marginBottom: '20px', display: 'flex', gap: '10px' }}>
+        
+        {/* THE NEW DROPDOWN MENU */}
+        <select 
+          value={matchId} 
           onChange={(e) => setMatchId(e.target.value)}
-          placeholder="Enter API-Football Match ID"
-          style={{ padding: '8px', marginRight: '10px', width: '200px' }}
-        />
+          disabled={isLoadingMatches}
+          style={{ padding: '8px', width: '300px' }}
+        >
+          {isLoadingMatches ? (
+            <option>Loading today's matches...</option>
+          ) : (
+            availableMatches.map((match) => (
+              <option key={match.match_id} value={match.match_id}>
+                {match.label}
+              </option>
+            ))
+          )}
+        </select>
+
         <button 
           onClick={fetchPrediction} 
-          disabled={isLoading}
+          disabled={isLoading || !matchId}
           style={{ padding: '8px 16px', cursor: 'pointer' }}
         >
-          {isLoading ? 'Fetching Database & Calculating...' : 'Fetch Prediction'}
+          {isLoading ? 'Calculating...' : 'Predict Outcome'}
         </button>
       </div>
-
-      {/* CONDITIONAL RENDERING: Only show this div if there's an error */}
-      {error && (
-        <div style={{ padding: '15px', backgroundColor: '#fee2e2', color: '#991b1b', borderRadius: '4px' }}>
-          <strong>Error:</strong> {error}
-        </div>
-      )}
 
       {/* CONDITIONAL RENDERING: Only show this div if we successfully got data */}
       {data && (

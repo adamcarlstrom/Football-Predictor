@@ -5,9 +5,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from supabase import create_client, Client
+from datetime import datetime
 
 # Load environment variables from the .env file
-load_dotenv()
+load_dotenv(override=True)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -27,6 +28,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+print("Server has started successfully")
+
 @app.get("/")
 def read_root():
     return {"message": "Football API backend is active"}
@@ -37,6 +40,7 @@ def fetch_and_predict(match_id: int):
     Triggered on-demand when a user clicks 'Fetch Prediction' on the frontend.
     Fetches fixture details from API-Football, cleans it, and returns a baseline prediction.
     """
+    print("Prediction requested")
     # 1. Fetch match data from API-Football
     url = f"https://v3.football.api-sports.io/fixtures?id={match_id}"
     headers = {
@@ -44,6 +48,7 @@ def fetch_and_predict(match_id: int):
         'x-rapidapi-key': FOOTBALL_API_KEY
     }
     
+    print("we will try")
     try:
         response = requests.get(url, headers=headers)
         response.raise_for_status()
@@ -71,14 +76,15 @@ def fetch_and_predict(match_id: int):
 
     # 3. Cache the teams in Supabase if they don't exist yet to avoid foreign key violations
     for prefix in ["home", "away"]:
-        supabase.table("teams").upsert({
+        supabase.table("Teams").upsert({
             "team_id": match_details[f"{prefix}_team_id"],
             "name": match_details[f"{prefix}_team_name"],
             "logo_url": match_details[f"{prefix}_team_logo"]
         }).execute()
 
+    print("Update tabless")
     # 4. Save/Update the match data in your matches table
-    supabase.table("matches").upsert({
+    supabase.table("Matches").upsert({
         "match_id": match_details["match_id"],
         "date": match_details["date"],
         "home_team_id": match_details["home_team_id"],
@@ -97,10 +103,42 @@ def fetch_and_predict(match_id: int):
     }
     
     # Save the prediction probabilities to Supabase
-    supabase.table("predictions").upsert(prediction_data).execute()
+    supabase.table("Predictions").upsert(prediction_data).execute()
 
+    print("Returning")
     # 6. Return the finalized payload to your React frontend
     return {
         "match_info": match_details,
         "prediction": prediction_data
     }
+    
+@app.get("/api/matches/today")
+def get_todays_matches():
+    """
+    Fetches a list of today's fixtures to populate the frontend dropdown menu.
+    """
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    url = f"https://v3.football.api-sports.io/fixtures?date={today_str}"
+    
+    headers = {
+        'x-rapidapi-host': 'v3.football.api-sports.io',
+        'x-rapidapi-key': FOOTBALL_API_KEY
+    }
+    
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Failed to fetch daily matches")
+
+    # Clean the data to send just what the dropdown needs
+    available_matches = []
+    for fixture in data.get("response", []):
+        if({fixture['league']['name']} == {'World Cup'}):
+            available_matches.append({
+                "match_id": fixture["fixture"]["id"],
+                "label": f"{fixture['teams']['home']['name']} vs {fixture['teams']['away']['name']} ({fixture['league']['name']})"
+            })
+        
+    return {"matches": available_matches}
