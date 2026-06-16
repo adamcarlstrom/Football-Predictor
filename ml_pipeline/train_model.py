@@ -66,25 +66,29 @@ def calculate_rest_days(current_date, last_match_date):
 def get_match_importance(league):
     match league:
         case "World Cup":
-            return (4,60)
+            return (5,60)
         case "Africa Cup of Nations":
-            return (3,30)
+            return (3,40)
         case "Asian Cup":
-            return (2,20)
-        case "Copa America":
-            return (3,30)
-        case "Euro Championship":
             return (3,35)
+        case "Copa America":
+            return (4,45)
+        case "Euro Championship":
+            return (4,50)
         case "UEFA Nations League":
-            return (2,20)
+            return (2,30)
         case "Friendlies":
-            return (1,10)
+            return (1,15)
         case _:
-            return (1,10)
+            return (1,15)
         
-def calculate_new_elo(home_elo, away_elo, actual_outcome, k_factor):
-    # Expected outcome math for Home Team
-    expected_home = 1 / (1 + 10 ** ((away_elo - home_elo) / 400))
+def calculate_new_elo(home_elo, away_elo, actual_outcome, k_factor, home_goals, away_goals, league_name):
+    # Add a flat 50-point artificial bump to the home team ONLY for the expectation math
+    neutral_leagues = ["World Cup", "Euro Championship", "Copa America", "Africa Cup of Nations", "Asian Cup"]
+    home_advantage = 0 if league_name in neutral_leagues else 100
+    
+    # Expected outcome math for Home Team with HFA factored in
+    expected_home = 1 / (1 + 10 ** ((away_elo - (home_elo + home_advantage)) / 400))
     expected_away = 1 - expected_home
     
     # Map our outcome (0, 1, 2) to ELO points (1, 0.5, 0)
@@ -94,10 +98,60 @@ def calculate_new_elo(home_elo, away_elo, actual_outcome, k_factor):
         home_points, away_points = 0, 1
     else: # Draw
         home_points, away_points = 0.5, 0.5
+    
+    if home_goals is None or away_goals is None:
+        g_multiplier = 1.0
+    else:
+        gd = abs(home_goals - away_goals)
+        if gd <= 1:
+            g_multiplier = 1.0
+        elif gd == 2:
+            g_multiplier = 1.5
+        else:
+            g_multiplier = (11 + gd) / 8.0
         
-    new_home_elo = home_elo + k_factor * (home_points - expected_home)
-    new_away_elo = away_elo + k_factor * (away_points - expected_away)
+    home_shift = k_factor * g_multiplier * (home_points - expected_home)
+    away_shift = k_factor * g_multiplier * (away_points - expected_away)
+    
+    new_home_elo = home_elo + home_shift
+    new_away_elo = away_elo + away_shift
     return new_home_elo, new_away_elo
+
+# Real-world baseline ELOs (Approximate strength as of early 2022)
+INITIAL_ELOS = {
+    1: 2030,   # Belgium
+    2: 2140,   # France
+    3: 1910,   # Croatia
+    4: 1780,   # Russia
+    5: 1840,   # Sweden
+    6: 2150,   # Brazil
+    7: 1930,   # Uruguay
+    8: 1900,   # Colombia
+    9: 2040,   # Spain
+    10: 2050,  # England
+    11: 1600,  # Panama
+    12: 1800,  # Japan
+    13: 1820,  # Senegal
+    14: 1880,  # Serbia
+    15: 1920,  # Switzerland
+    16: 1880,  # Mexico
+    17: 1790,  # South Korea
+    18: 1680,  # Iceland
+    19: 1740,  # Nigeria
+    20: 1750,  # Australia
+    21: 1900,  # Denmark
+    22: 1810,  # Iran
+    23: 1650,  # Saudi Arabia
+    24: 1770,  # Poland
+    25: 1950,  # Germany
+    26: 2140,  # Argentina
+    27: 2000,  # Portugal
+    28: 1720,  # Tunisia
+    29: 1680,  # Costa Rica
+    30: 1850,  # Peru
+    31: 1810,  # Morocco
+    32: 1730   # Egypt
+}
 
 # We iterate through every match in chronological order
 for index, row in df.iterrows():
@@ -105,8 +159,12 @@ for index, row in df.iterrows():
     away = row['away_team_id']
     
     # Initialize teams in our ledger if we haven't seen them yet
-    if home not in team_stats: team_stats[home] = {'elo': 1500,'last_match_date': None,'results': [], 'goals_for': [], 'goals_against': []}
-    if away not in team_stats: team_stats[away] = {'elo': 1500,'last_match_date': None,'results': [], 'goals_for': [], 'goals_against': []}
+    if home not in team_stats: 
+        start_elo = INITIAL_ELOS.get(home, 1300)
+        team_stats[home] = {'elo': start_elo,'last_match_date': None,'results': [], 'goals_for': [], 'goals_against': []}
+    if away not in team_stats: 
+        start_elo = INITIAL_ELOS.get(away, 1300)
+        team_stats[away] = {'elo': start_elo,'last_match_date': None,'results': [], 'goals_for': [], 'goals_against': []}
     
 
 
@@ -162,7 +220,7 @@ for index, row in df.iterrows():
     
     
     
-    new_home_elo, new_away_elo = calculate_new_elo(team_stats[home]['elo'], team_stats[away]['elo'], row['outcome'], k_factor)
+    new_home_elo, new_away_elo = calculate_new_elo(team_stats[home]['elo'], team_stats[away]['elo'], row['outcome'], k_factor, row['home_goals'],row['away_goals'],row['league_name'] )
     team_stats[home]['elo'] = new_home_elo
     team_stats[away]['elo'] = new_away_elo
     
