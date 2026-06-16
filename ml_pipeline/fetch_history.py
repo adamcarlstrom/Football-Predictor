@@ -27,6 +27,13 @@ TOURNAMENT_MAP = {
     7: [2023] , # Asian CUP
     9: [2024], # Copa America # 2019, 2021 not available
     10: [2022, 2023, 2024], # Friendlies (limiting to recent years to save tokens)
+    29: [2022,2023], # World Cup Qualifications Africa
+    30: [2022], # World Cup Qualifications Asia
+    31: [2022],#  World Cup Qualifications Concacaf
+    32: [2024], # World Cup Qualifications Europe
+    33: [2022], # World Cup Qualifications Oceania
+    34: [2022], # World Cup Qualifications South America
+    37: [2022] # World Cup Qualifications Intercontinental Play-offs
      
 }
 

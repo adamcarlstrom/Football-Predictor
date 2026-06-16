@@ -13,7 +13,7 @@ supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_
 
 print("1. Extracting historical matches from Supabase...")
 # Fetch all matches, ordered by date. Chronological order is critical for rolling averages!
-response = supabase.table("Matches").select("*").order("date").execute()
+response = supabase.table("Matches").select("*").in_("status", ["FT", "AET", "PEN"]).order("date").execute()
 df = pd.DataFrame(response.data)
 
 # Convert dates from strings to actual datetime objects
@@ -123,7 +123,7 @@ for index, row in df.iterrows():
         if len(stats['results']) < 1:
             return {'win_rate': 0, 'gd': 0} # Default to 0 if it's their very first game
         
-        nr_matches = 5
+        nr_matches = 10
         # Look only at the last nr_matches matches
         recent_results = stats['results'][-nr_matches:]
         recent_gf = sum(stats['goals_for'][-nr_matches:])
@@ -190,7 +190,7 @@ y = df_clean['outcome']
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
 # Create the mathematical model
-model = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
+model = RandomForestClassifier(n_estimators=200, max_depth=6, random_state=42)
 
 # TRAIN IT! (This is where the model finds the patterns)
 model.fit(X_train, y_train)
