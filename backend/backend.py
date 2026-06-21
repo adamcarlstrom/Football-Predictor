@@ -1,12 +1,13 @@
 import os
 import requests
+import math
 import pandas as pd
 import joblib
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from supabase import create_client, Client
-from datetime import datetime, timezone
+from datetime import datetime, timezone ,timedelta
 
 # Load environment variables from the .env file
 load_dotenv(override=True)
@@ -114,23 +115,29 @@ def fetch_and_predict(match_id: int):
     away_id = match_details["away_team_id"]
     match_date = match_details["date"]
 
-    # HELPER: Quick function to get a team's last 5 matches from Supabase
+    # HELPER: Quick function to get a team's last nr matches from Supabase
     def get_live_team_stats(team_id):
-        # Query the database for the last 5 matches this team played BEFORE today
-        res = supabase.table("Matches").select("*").or_(f"home_team_id.eq.{team_id},away_team_id.eq.{team_id}").lt("date", match_date).order("date", desc=True).limit(5).execute()
+        # Query the database for the last nr matches this team played BEFORE today
+        nr = 10
+        res = supabase.table("Matches").select("*").in_("status", ["FT", "AET", "PEN"]).or_(f"home_team_id.eq.{team_id},away_team_id.eq.{team_id}").lt("date", match_date).order("date", desc=True).limit(nr).execute()
         
         matches = res.data
         if not matches:
+            print(f"DEBUG: No historical matches found for (ID: {team_id})")
             return {"win_rate": 0.0, "gd": 0.0, "rest_days": 14}
             
         wins = 0
         goals_for = 0
         goals_against = 0
         
+        print(f"\n--- DEBUG: Last {len(matches)} matches for {team_id} ---")
+                
         for m in matches:
             is_home = m["home_team_id"] == team_id
             team_goals = m["home_goals"] if is_home else m["away_goals"]
             opp_goals = m["away_goals"] if is_home else m["home_goals"]
+            
+            print(f"Date: {m['date'][:10]} | Goals For: {team_goals} | Goals Against: {opp_goals} | Status: {m['status']}")
             
             # Count goals (if not null)
             if team_goals is not None and opp_goals is not None:
@@ -153,6 +160,8 @@ def fetch_and_predict(match_id: int):
         current_date = pd.to_datetime(match_date)
         rest_days = min(abs((current_date - last_match_date).days), 14)
         
+        print(f"> RESULT FOR {team_id}: Win Rate: {win_rate:.2f}, GD/Match: {gd:.2f}, Rest: {rest_days} days\n")
+        
         return {"win_rate": win_rate, "gd": gd, "rest_days": rest_days}
 
     # Fetch live stats for both teams
@@ -174,9 +183,10 @@ def fetch_and_predict(match_id: int):
     
     # Simple importance mapping for the live match
     league_name = match_details["league_name"]
-    if league_name == "World Cup": live_importance = 3
-    elif league_name in ["Euro Championship", "Copa America", "Africa Cup of Nations", "Asian Cup"]: live_importance = 2
-    elif league_name == "UEFA Nations League": live_importance = 2
+    if league_name == "World Cup": live_importance = 5
+    elif league_name in ["Euro Championship", "Copa America"]: live_importance = 4
+    elif league_name in ["Asian Cup", "Africa Cup of Nations"]: live_importance = 3
+    elif league_name in ["UEFA Nations League"]: live_importance = 2
     else: live_importance = 1
 
     # Create the input array (MUST MATCH THE EXACT ORDER OF YOUR TRAINING SCRIPT)
@@ -190,97 +200,179 @@ def fetch_and_predict(match_id: int):
 
     # Ask the Random Forest for the probabilities!
     probabilities = ml_model.predict_proba(X_live)[0]
+    
+    # Get the exact order of the classes the model learned
+    classes = ml_model.classes_
+    
+    # Safely extract the probabilities by matching the class number 
+    # (0 = Home, 1 = Draw, 2 = Away) to its index in the array
+    try:
+        home_index = list(classes).index(0)
+        draw_index = list(classes).index(1)
+        away_index = list(classes).index(2)
+        
+        home_prob = probabilities[home_index]
+        draw_prob = probabilities[draw_index]
+        away_prob = probabilities[away_index]
+    except ValueError:
+        # Fallback if classes are somehow missing (rare)
+        home_prob, draw_prob, away_prob = probabilities[0], probabilities[1], probabilities[2]
 
+    pred_home_goals, pred_away_goals = generate_poisson_scoreline(home_prob, draw_prob, away_prob)
+    
     # Map the probabilities to the database payload
     prediction_data = {
         "match_id": match_details["match_id"],
-        "home_win_prob": round(float(probabilities[0]), 4),
-        "draw_prob": round(float(probabilities[1]), 4),
-        "away_win_prob": round(float(probabilities[2]), 4)
+        "home_win_prob": round(float(home_prob), 4),
+        "draw_prob": round(float(draw_prob), 4),
+        "away_win_prob": round(float(away_prob), 4),
+        "predicted_home_goals": pred_home_goals,
+        "predicted_away_goals": pred_away_goals
     }
     
     # Save the prediction probabilities to Supabase
     supabase.table("Predictions").upsert(prediction_data).execute()
-
+    print(prediction_data)
     return {
         "match_info": match_details,
         "prediction": prediction_data
     }
     
-@app.get("/api/matches/today")
-def get_todays_matches():
+@app.get("/api/matches")
+def get_matches_by_date(date: str = None):
     """
-    Fetches a list of today's fixtures. Checks Supabase first to save API quota.
-    If empty, fetches from API-Football and caches the result in Supabase.
+    Fetches World Cup matches for a specific date. 
+    If no date is provided, defaults to today.
     """
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    start_of_day = f"{today_str}T00:00:00Z"
-    end_of_day = f"{today_str}T23:59:59Z"
-    
-    # --- 1. THE CACHE CHECK ---
-    # We ask Supabase for today's matches, and ask it to join the team names
-    db_response = supabase.table("Matches").select(
-        "match_id, home:Teams!home_team_id(name), away:Teams!away_team_id(name)"
-    ).gte("date", start_of_day).lte("date", end_of_day).execute()
-    
-    # If Supabase has the data, return it immediately and STOP here.
-    if db_response.data and len(db_response.data) > 0:
-        print("CACHE HIT: Serving matches from Supabase")
-        available_matches = []
-        for row in db_response.data:
-            home_name = row["home"]["name"] if row.get("home") else "Unknown"
-            away_name = row["away"]["name"] if row.get("away") else "Unknown"
-            available_matches.append({
-                "match_id": row["match_id"],
-                "label": f"{home_name} vs {away_name}"
-            })
-        return {"matches": available_matches}
+    # 1. Determine the target date
+    if date:
+        target_date_str = date
     else:
-        print("CACHE MISS: Fetching Matches from API")
-        url = f"https://v3.football.api-sports.io/fixtures?date={today_str}"
-        
-        headers = {
-            'x-rapidapi-host': 'v3.football.api-sports.io',
-            'x-rapidapi-key': FOOTBALL_API_KEY
-        }
-        
+        target_date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
+    start_of_window = f"{target_date_str}T00:00:00+00:00"
+    end_of_window = (target_dt + timedelta(days=1)).strftime("%Y-%m-%dT12:00:00+00:00")    
+    start_of_day = f"{target_date_str}T00:00:00Z"
+    end_of_day = f"{target_date_str}T23:59:59Z"
+
+    # Helper function to grab the fully joined data from Supabase
+    def fetch_joined_db_data():
+        return supabase.table("Matches").select(
+            "match_id, date, status, home_goals, away_goals, "
+            "home:Teams!home_team_id(name, logo_url), "
+            "away:Teams!away_team_id(name, logo_url), "
+            "prediction:Predictions(home_win_prob, draw_prob, away_win_prob, predicted_home_goals, predicted_away_goals)"
+        ).eq("league_name","World Cup").gte("date", start_of_window).lte("date", end_of_window).order("date").execute()
+
+    # --- 1. THE CACHE CHECK ---
+    db_response = fetch_joined_db_data()
+    
+    if db_response.data and len(db_response.data) > 0:
+        print(f"CACHE HIT: Serving matches for {target_date_str} from Supabase")
+        return {"matches": db_response.data}
+
+    # --- 2. CACHE MISS: Fetch from API ---
+    print(f"CACHE MISS: Fetching Matches for {target_date_str} from API-Football")
+    url = f"https://v3.football.api-sports.io/fixtures?date={target_date_str}&timezone=America/New_York"
+    headers = {
+        'x-rapidapi-host': 'v3.football.api-sports.io',
+        'x-rapidapi-key': FOOTBALL_API_KEY
+    }
+    
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Failed to fetch matches for date")
+    print("Here comes new data: " ,data)
+    if(data == []):
         try:
             response = requests.get(url, headers=headers)
             response.raise_for_status()
             data = response.json()
+            
+            # --- NEW DEBUG BLOCK ---
+            print(f"\n--- API DATA FOR {target_date_str} ---")
+            found_leagues = set()
+            for fix in data.get("response", []):
+                found_leagues.add(fix["league"]["name"])
+            print(f"Leagues playing on this date: {found_leagues}")
+            # -----------------------
+            
         except Exception as e:
-            raise HTTPException(status_code=500, detail="Failed to fetch daily matches")
-
-        # --- 3. CACHE THE NEW DATA ---
-        available_matches = []
-        for fixture in data.get("response", []):
-            # print(fixture["league"]["name"])
-            if(fixture["league"]["name"] == 'World Cup'):
-                match_id = fixture["fixture"]["id"]
-                home_team = fixture["teams"]["home"]
-                away_team = fixture["teams"]["away"]
-                
-                # Prepare the label for React
-                available_matches.append({
-                    "match_id": match_id,
-                    "label": f"{home_team['name']} vs {away_team['name']}"
-                })
-                
-                # Save Teams to Supabase
-                for team in [home_team, away_team]:
-                    supabase.table("Teams").upsert({
-                        "team_id": team["id"],
-                        "name": team["name"],
-                        "logo_url": team["logo"]
-                    }).execute()
-
-                # Save Match to Supabase
-                supabase.table("Matches").upsert({
-                    "match_id": match_id,
-                    "date": fixture["fixture"]["date"],
-                    "home_team_id": home_team["id"],
-                    "away_team_id": away_team["id"],
-                    "status": fixture["fixture"]["status"]["short"]
+            raise HTTPException(status_code=500, detail="Failed to fetch matches for date")
+    
+    # --- 3. SAVE THE NEW DATA ---
+    for fixture in data.get("response", []):
+        if fixture["league"]["name"] == 'World Cup':
+            match_id = fixture["fixture"]["id"]
+            home_team = fixture["teams"]["home"]
+            away_team = fixture["teams"]["away"]
+            
+            for team in [home_team, away_team]:
+                supabase.table("Teams").upsert({
+                    "team_id": team["id"],
+                    "name": team["name"],
+                    "logo_url": team["logo"]
                 }).execute()
 
-        return {"matches": available_matches}
+            supabase.table("Matches").upsert({
+                "match_id": match_id,
+                "date": fixture["fixture"]["date"],
+                "home_team_id": home_team["id"],
+                "away_team_id": away_team["id"],
+                "status": fixture["fixture"]["status"]["short"],
+                "home_goals": fixture["goals"]["home"], 
+                "away_goals": fixture["goals"]["away"],
+                "league_name": fixture["league"]["name"]
+            }).execute()
+
+    # --- 4. RETURN RE-FETCHED DATA ---
+    db_response = fetch_joined_db_data()
+    print(db_response.data)
+    return {"matches": db_response.data}
+
+def generate_poisson_scoreline(prob_home, prob_draw, prob_away):
+    """
+    Translates ML win probabilities into an exact, discrete integer scoreline 
+    using the Poisson distribution.
+    """
+    # 1. Map probabilities to Expected Goals (lambda)
+    # Using a baseline of ~3.0 total goals per match
+    lambda_home = max(0.1, 3.0 * prob_home + 0.5 * prob_draw)
+    lambda_away = max(0.1, 3.0 * prob_away + 0.5 * prob_draw)
+
+    # 2. Generate Poisson probabilities for 0 to 5 goals
+    def get_poisson_prob(k, lam):
+        return ((lam ** k) * math.exp(-lam)) / math.factorial(k)
+
+    home_probs = [get_poisson_prob(i, lambda_home) for i in range(6)]
+    away_probs = [get_poisson_prob(i, lambda_away) for i in range(6)]
+
+    # 3. Determine the ML model's favored outcome to strictly align the UI
+    favored_outcome = 0 # 0=Home, 1=Draw, 2=Away
+    if prob_draw >= prob_home and prob_draw >= prob_away:
+        favored_outcome = 1
+    elif prob_away >= prob_home and prob_away >= prob_draw:
+        favored_outcome = 2
+
+    # 4. Search the 6x6 grid for the most likely valid scoreline
+    best_prob = -1
+    best_score = (0, 0)
+
+    for h in range(6):
+        for a in range(6):
+            joint_prob = home_probs[h] * away_probs[a]
+            
+            # Check if this scoreline strictly matches the ML prediction
+            is_valid = False
+            if favored_outcome == 0 and h > a: is_valid = True
+            elif favored_outcome == 1 and h == a: is_valid = True
+            elif favored_outcome == 2 and h < a: is_valid = True
+
+            if is_valid and joint_prob > best_prob:
+                best_prob = joint_prob
+                best_score = (h, a)
+
+    return best_score

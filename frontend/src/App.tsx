@@ -1,151 +1,169 @@
 import { useState, useEffect } from 'react';
 
-// 1. Types: We define the shape of the data we expect from the Python backend.
-// This gives us autocomplete and prevents typos.
-interface PredictionData {
-  match_info: {
-    match_id: number;
-    home_team_name: string;
-    away_team_name: string;
-    status: string;
-  };
-  prediction: {
-    home_win_prob: number;
-    draw_prob: number;
-    away_win_prob: number;
-  };
-}
-
-interface MatchOption {
+interface DashboardMatch {
   match_id: number;
-  label: string;
+  date: string;
+  status: string;
+  home_goals: number | null;
+  away_goals: number | null;
+  home: { name: string; logo_url: string };
+  away: { name: string; logo_url: string };
+  prediction: { 
+    home_win_prob: number; 
+    draw_prob: number; 
+    away_win_prob: number;
+    predicted_home_goals: number;
+    predicted_away_goals: number;
+  }[] | null;
 }
 
 export default function App() {
-  // 2. State Hooks: React's memory. 
-  // 'matchId' tracks what the user types in the input box.
-  const [matchId, setMatchId] = useState<string>('718243'); // Using a default ID for testing
+  const [matches, setMatches] = useState<DashboardMatch[]>([]);
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [predictingId, setPredictingId] = useState<number | null>(null);
   
-  // These track the network request lifecycle
-  const [data, setData] = useState<PredictionData | null>(null);
-  const [isLoading, setIsLoading] = useState<boolean>(false);
-  const [error, setError] = useState<string | null>(null);
+  // State to track the currently selected date (Defaults to today in YYYY-MM-DD format)
+  const [selectedDate, setSelectedDate] = useState<string>(new Date().toISOString().split('T')[0]);
 
-  // To hold list of matches
-  const [availableMatches, setAvailableMatches] = useState<MatchOption[]>([]);
-  const [isLoadingMatches, setIsLoadingMatches] = useState<boolean>(true);
-
-  useEffect(() => {
-    const fetchDropdownData = async () => {
-      try {
-        const response = await fetch('http://127.0.0.1:8000/api/matches/today');
-        const result = await response.json();
-        setAvailableMatches(result.matches);
-        // Auto-select the first match in the list if it exists
-        if (result.matches.length > 0) {
-          setMatchId(result.matches[0].match_id.toString());
-        }
-      } catch (err) {
-        console.error("Failed to load matches for dropdown", err);
-      } finally {
-        setIsLoadingMatches(false);
-      }
-    };
-
-    fetchDropdownData();
-  }, []); // The empty array [] means this only runs once on load
-
-  // 3. The Action Function: Triggered when the button is clicked.
-  const fetchPrediction = async () => {
-    if (!matchId) return;
-
-    // Reset previous states before starting a new request
+  // Function now accepts the date parameter
+  const fetchMatches = async (dateStr: string) => {
     setIsLoading(true);
-    setError(null);
-    setData(null);
-
     try {
-      // 4. The Network Call: Hitting your local FastAPI server.
-      const response = await fetch(`http://127.0.0.1:8000/api/matches/${matchId}/predict`, {
-        method: 'POST', 
-        headers: {
-          'Content-Type': 'application/json',
-        },
+      // Added the 'cache' property to bypass the browser's aggressive caching
+      console.log("Fetching matches by date")
+      const response = await fetch(`http://127.0.0.1:8000/api/matches?date=${dateStr}`, {
+        cache: 'no-store' 
       });
-
-      if (!response.ok) {
-        throw new Error(`Backend returned status: ${response.status}`);
-      }
-
-      // 5. Updating State: This triggers a re-render to show the new data
-      const jsonData = await response.json();
-      setData(jsonData);
-      
-    } catch (err: any) {
-      setError(err.message || 'Failed to fetch prediction');
+      const result = await response.json();
+      console.log(result)
+      setMatches(result.matches || []);
+    } catch (err) {
+      console.error(`Failed to load matches for ${dateStr}`, err);
     } finally {
-      // Whether it succeeded or failed, we are no longer loading
       setIsLoading(false);
     }
   };
 
-  // 6. The UI Render: This uses conditional rendering.
-  // It checks the state variables to decide what HTML to show.
+  // The dependency array now includes selectedDate. 
+  // If the user changes the date, this automatically re-runs.
+  useEffect(() => {
+    fetchMatches(selectedDate);
+  }, [selectedDate]);
+
+  const handlePredict = async (matchId: number) => {
+    setPredictingId(matchId);
+    try {
+      console.log("Predicting match")
+      await fetch(`http://127.0.0.1:8000/api/matches/${matchId}/predict`, { 
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      await fetchMatches(selectedDate); // Refresh current date's view
+    } catch (err) {
+      console.error("Prediction failed", err);
+    } finally {
+      setPredictingId(null);
+    }
+  };
+
   return (
-    <div style={{ padding: '40px', fontFamily: 'system-ui, sans-serif', maxWidth: '600px', margin: '0 auto' }}>
-      <h1>Match Predictor</h1>
-      <p>Showing todays matches</p>
-      <div style={{ marginBottom: '20px', display: 'flex', gap: '10px' }}>
+    <div style={{width: '100vw', fontFamily: 'system-ui, sans-serif', backgroundColor: '#f8f9fa', minHeight: '100vh', padding: '40px 20px' }}>
+      
+      {/* HEADER & DATE CONTROLS */}
+      <div style={{ maxWidth: '800px', margin: '0 auto', marginBottom: '40px' }}>
+        <h1 style={{ textAlign: 'center', color: '#2c3e50', marginBottom: '20px' }}>World Cup Match Predictor</h1>
         
-        {/* THE NEW DROPDOWN MENU */}
-        <select 
-          value={matchId} 
-          onChange={(e) => setMatchId(e.target.value)}
-          disabled={isLoadingMatches}
-          style={{ padding: '8px', width: '300px' }}
-        >
-          {isLoadingMatches ? (
-            <option>Loading today's matches...</option>
-          ) : (
-            availableMatches.map((match) => (
-              <option key={match.match_id} value={match.match_id}>
-                {match.label}
-              </option>
-            ))
-          )}
-        </select>
-
-        <button 
-          onClick={fetchPrediction} 
-          disabled={isLoading || !matchId}
-          style={{ padding: '8px 16px', cursor: 'pointer' }}
-        >
-          {isLoading ? 'Calculating...' : 'Predict Outcome'}
-        </button>
-      </div>
-
-      {/* CONDITIONAL RENDERING: Only show this div if we successfully got data */}
-      {data && (
-        <div style={{ padding: '20px', border: '1px solid #ccc', borderRadius: '8px', marginTop: '20px' }}>
-          <h2>{data.match_info.home_team_name} vs {data.match_info.away_team_name}</h2>
-          <p>Status: {data.match_info.status}</p>
-          
-          <hr style={{ margin: '20px 0' }} />
-          
-          <h3>ML Model Probabilities</h3>
-          <ul style={{ listStyle: 'none', padding: 0 }}>
-            <li style={{ marginBottom: '10px' }}>
-              <strong>Home Win:</strong> {(data.prediction.home_win_prob * 100).toFixed(1)}%
-            </li>
-            <li style={{ marginBottom: '10px' }}>
-              <strong>Draw:</strong> {(data.prediction.draw_prob * 100).toFixed(1)}%
-            </li>
-            <li style={{ marginBottom: '10px' }}>
-              <strong>Away Win:</strong> {(data.prediction.away_win_prob * 100).toFixed(1)}%
-            </li>
-          </ul>
+        <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '15px', backgroundColor: '#fff', padding: '15px', borderRadius: '12px', boxShadow: '0 4px 12px rgba(0,0,0,0.05)', border: '1px solid #eaeaea' }}>
+          <label htmlFor="date-picker" style={{ fontWeight: 'bold', color: '#34495e' }}>Select Match Day:</label>
+          <input 
+            id="date-picker"
+            type="date" 
+            value={selectedDate}
+            onChange={(e) => setSelectedDate(e.target.value)}
+            style={{ padding: '10px', borderRadius: '8px', border: '1px solid #bdc3c7', fontSize: '16px', outline: 'none', cursor: 'pointer' }}
+          />
         </div>
-      )}
+      </div>
+      
+      {/* MATCH FEED */}
+      <div style={{ maxWidth: '800px', margin: '0 auto' }}>
+        {isLoading ? (
+          <div style={{ textAlign: 'center', color: '#7f8c8d' }}>Loading matches for {selectedDate}...</div>
+        ) : matches.length === 0 ? (
+          <div style={{ textAlign: 'center', color: '#7f8c8d', padding: '40px', backgroundColor: '#fff', borderRadius: '12px' }}>
+            No World Cup matches found on {selectedDate}.
+          </div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+            {matches.map(match => {
+              let pred: any = null;
+              if (Array.isArray(match.prediction) && match.prediction.length > 0) {
+                pred = match.prediction[0]; // Extract from Array
+              } else if (match.prediction && !Array.isArray(match.prediction)) {
+                pred = match.prediction; // Extract directly from Object
+              }
+              const isUpcoming = match.status === 'NS';
+              const homeScore = match.home_goals !== null ? match.home_goals : '0';
+              const awayScore = match.away_goals !== null ? match.away_goals : '0';
+
+              return (
+                <div key={match.match_id} style={{ backgroundColor: '#fff', padding: '20px', borderRadius: '12px', boxShadow: '0 4px 12px rgba(0,0,0,0.05)', border: '1px solid #eaeaea' }}>
+                  
+                  {/* Match Status Header */}
+                  <div style={{ textAlign: 'center', marginBottom: '15px', fontSize: '12px', fontWeight: 'bold', color: isUpcoming ? '#95a5a6' : '#e74c3c', textTransform: 'uppercase' }}>
+                    {isUpcoming ? 'Upcoming' : match.status === 'FT' || match.status === 'PEN' ? 'Full Time' : `Live: ${match.status}`}
+                  </div>
+
+                  {/* Teams and Actual Scoreline */}
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
+                    <div style={{ textAlign: 'center', flex: 1 }}>
+                      <img src={match.home.logo_url} alt={match.home.name} style={{height: '50px', objectFit: 'contain' }} />
+                      <div style={{ fontWeight: 'bold', fontSize: '16px', marginTop: '8px', color: '#2c3e50' }}>{match.home.name}</div>
+                    </div>
+                    
+                    <div style={{ fontSize: '32px', fontWeight: '900', padding: '0 20px', color: '#2c3e50', letterSpacing: '2px' }}>
+                       {isUpcoming ? 'vs' : `${homeScore} - ${awayScore}`}
+                    </div>
+
+                    <div style={{ textAlign: 'center', flex: 1 }}>
+                      <img src={match.away.logo_url} alt={match.away.name} style={{ height: '50px', objectFit: 'contain' }} />
+                      <div style={{ fontWeight: 'bold', fontSize: '16px', marginTop: '8px', color: '#2c3e50' }}>{match.away.name}</div>
+                    </div>
+                  </div>
+
+                  {/* AI Prediction Section */}
+                  <div style={{ borderTop: '1px solid #f1f2f6', paddingTop: '15px', color:'black' }}>
+                    {pred ? (
+                      <div style={{ fontSize: '14px', textAlign: 'center' }}>
+                        <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '10px', color: '#7f8c8d', marginBottom: '8px', fontSize: '12px', textTransform: 'uppercase', letterSpacing: '1px' }}>
+                          <span>AI Prediction</span>
+                          {/* NEW: Display the Poisson Predicted Goals */}
+                          <span style={{ backgroundColor: '#2c3e50', color: '#fff', padding: '3px 8px', borderRadius: '12px', fontWeight: 'bold' }}>
+                            Score: {pred.predicted_home_goals} - {pred.predicted_away_goals}
+                          </span>
+                        </div>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', backgroundColor: '#f8f9fa', padding: '10px', borderRadius: '8px' }}>
+                          <span style={{ color: '#2ecc71', fontWeight: '800' }}>{match.home.name}: {(pred.home_win_prob * 100).toFixed(1)}%</span>
+                          <span style={{ color: '#95a5a6', fontWeight: '600' }}>Draw: {(pred.draw_prob * 100).toFixed(1)}%</span>
+                          <span style={{ color: '#e74c3c', fontWeight: '800' }}>{match.away.name}: {(pred.away_win_prob * 100).toFixed(1)}%</span>
+                        </div>
+                      </div>
+                    ) : (
+                      <button 
+                        onClick={() => handlePredict(match.match_id)}
+                        disabled={predictingId === match.match_id}
+                        style={{ width: '100%', padding: '12px', backgroundColor: '#2980b9', color: 'white', border: 'none', borderRadius: '8px', cursor: 'pointer', fontWeight: 'bold', fontSize: '14px' }}
+                      >
+                        {predictingId === match.match_id ? 'Calculating AI Prediction...' : 'Generate Prediction'}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
