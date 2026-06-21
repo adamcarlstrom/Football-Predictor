@@ -154,6 +154,8 @@ def fetch_and_predict(match_id: int):
                         
         win_rate = wins / len(matches)
         gd = (goals_for - goals_against) / len(matches)
+        gf_avg = goals_for / len(matches)
+        ga_avg = goals_against / len(matches)
         
         # Calculate rest days
         last_match_date = pd.to_datetime(matches[0]["date"])
@@ -162,7 +164,10 @@ def fetch_and_predict(match_id: int):
         
         print(f"> RESULT FOR {team_id}: Win Rate: {win_rate:.2f}, GD/Match: {gd:.2f}, Rest: {rest_days} days\n")
         
-        return {"win_rate": win_rate, "gd": gd, "rest_days": rest_days}
+        return {"win_rate": win_rate, "gd": gd, "rest_days": rest_days,
+            "gf_avg": gf_avg, 
+            "ga_avg": ga_avg  
+            }
 
     # Fetch live stats for both teams
     home_stats = get_live_team_stats(home_id)
@@ -176,6 +181,10 @@ def fetch_and_predict(match_id: int):
     away_elo = away_team_data.data.get("current_elo") or 1500.0
 
     # Construct the 5 features exactly as the model expects them
+    home_gf = home_stats["gf_avg"]
+    home_ga = home_stats["ga_avg"]
+    away_gf = away_stats["gf_avg"]
+    away_ga = away_stats["ga_avg"]
     live_home_win_rate_diff = home_stats["win_rate"] - away_stats["win_rate"]
     live_home_gd_diff = home_stats["gd"] - away_stats["gd"]
     live_rest_days_diff = home_stats["rest_days"] - away_stats["rest_days"]
@@ -218,7 +227,10 @@ def fetch_and_predict(match_id: int):
         # Fallback if classes are somehow missing (rare)
         home_prob, draw_prob, away_prob = probabilities[0], probabilities[1], probabilities[2]
 
-    pred_home_goals, pred_away_goals = generate_poisson_scoreline(home_prob, draw_prob, away_prob)
+    pred_home_goals, pred_away_goals = generate_poisson_scoreline(
+        home_prob, draw_prob, away_prob, 
+        home_gf, home_ga, away_gf, away_ga
+    )
     
     # Map the probabilities to the database payload
     prediction_data = {
@@ -333,39 +345,42 @@ def get_matches_by_date(date: str = None):
     print(db_response.data)
     return {"matches": db_response.data}
 
-def generate_poisson_scoreline(prob_home, prob_draw, prob_away):
+def generate_poisson_scoreline(prob_home, prob_draw, prob_away, home_gf, home_ga, away_gf, away_ga):
     """
-    Translates ML win probabilities into an exact, discrete integer scoreline 
-    using the Poisson distribution.
+    Translates ML win probabilities and 10-game offensive/defensive form into realistic scorelines.
     """
-    # 1. Map probabilities to Expected Goals (lambda)
-    # Using a baseline of ~3.0 total goals per match
-    lambda_home = max(0.1, 3.0 * prob_home + 0.5 * prob_draw)
-    lambda_away = max(0.1, 3.0 * prob_away + 0.5 * prob_draw)
+    # 1. Base Expected Goals (xG) based on 10-game form
+    # Home offense vs Away defense
+    base_home_xg = (home_gf + away_ga) / 2.0
+    # Away offense vs Home defense
+    base_away_xg = (away_gf + home_ga) / 2.0
 
-    # 2. Generate Poisson probabilities for 0 to 5 goals
+    # 2. Scale by ML Probability (Baseline chance in a 3-way match is ~33.3%)
+    # If the model gives them an 80% chance to win, their xG skyrockets.
+    lambda_home = max(0.1, base_home_xg * (prob_home / 0.333))
+    lambda_away = max(0.1, base_away_xg * (prob_away / 0.333))
+
     def get_poisson_prob(k, lam):
         return ((lam ** k) * math.exp(-lam)) / math.factorial(k)
 
-    home_probs = [get_poisson_prob(i, lambda_home) for i in range(6)]
-    away_probs = [get_poisson_prob(i, lambda_away) for i in range(6)]
+    # Calculate probabilities up to 6 goals
+    home_probs = [get_poisson_prob(i, lambda_home) for i in range(7)]
+    away_probs = [get_poisson_prob(i, lambda_away) for i in range(7)]
 
-    # 3. Determine the ML model's favored outcome to strictly align the UI
-    favored_outcome = 0 # 0=Home, 1=Draw, 2=Away
+    favored_outcome = 0 
     if prob_draw >= prob_home and prob_draw >= prob_away:
         favored_outcome = 1
     elif prob_away >= prob_home and prob_away >= prob_draw:
         favored_outcome = 2
 
-    # 4. Search the 6x6 grid for the most likely valid scoreline
     best_prob = -1
     best_score = (0, 0)
 
-    for h in range(6):
-        for a in range(6):
+    # Search a 7x7 grid to allow for 6-0 blowouts
+    for h in range(7):
+        for a in range(7):
             joint_prob = home_probs[h] * away_probs[a]
             
-            # Check if this scoreline strictly matches the ML prediction
             is_valid = False
             if favored_outcome == 0 and h > a: is_valid = True
             elif favored_outcome == 1 and h == a: is_valid = True
