@@ -48,8 +48,12 @@ features = {
     'home_gd_diff': [],
     'elo_diff': [],
     'rest_days_diff': [],
-    'match_importance': []
+    'match_importance': [],
+    'h2h_win_diff': [],  # Head to Head Win Difference
+    'h2h_gd_diff': []    # Head to Head Goal Difference
 }
+
+h2h_stats = {} # NEW: Dictionary to hold the historical rivalry between any two teams
 
 def determine_outcome(row):
     if row['status'] == 'PEN': return 1
@@ -174,6 +178,25 @@ for index, row in df.iterrows():
     elo_diff = team_stats[home]['elo'] - team_stats[away]['elo']
     importance_weight, k_factor = get_match_importance(row['league_name'])
 
+    h2h_key_home_away = (home, away)
+    h2h_key_away_home = (away, home)
+    
+    if h2h_key_home_away not in h2h_stats:
+        h2h_stats[h2h_key_home_away] = []
+        h2h_stats[h2h_key_away_home] = []
+        
+    recent_h2h = h2h_stats[h2h_key_home_away][-3:] # Look at the last 3 matchups
+    if len(recent_h2h) == 0:
+        h2h_win_diff = 0.0
+        h2h_gd_diff = 0.0
+    else:
+        h_wins = sum(1 for h_g, a_g in recent_h2h if h_g > a_g)
+        a_wins = sum(1 for h_g, a_g in recent_h2h if a_g > h_g)
+        h_goals = sum(h_g for h_g, a_g in recent_h2h)
+        a_goals = sum(a_g for h_g, a_g in recent_h2h)
+        
+        h2h_win_diff = (h_wins - a_wins) / len(recent_h2h)
+        h2h_gd_diff = (h_goals - a_goals) / len(recent_h2h)
     
     # Calculate PRE-MATCH stats based on the last 5 games
     def get_recent_stats(team_id):
@@ -200,6 +223,8 @@ for index, row in df.iterrows():
     features['elo_diff'].append(elo_diff)
     features['rest_days_diff'].append(rest_diff)
     features['match_importance'].append(importance_weight)
+    features['h2h_win_diff'].append(h2h_win_diff) 
+    features['h2h_gd_diff'].append(h2h_gd_diff)   
     
     # AFTER calculating pre-match stats, update the ledger with the current match's result
     # so it can be used for their next game.
@@ -226,6 +251,10 @@ for index, row in df.iterrows():
     
     team_stats[home]['last_match_date'] = row['date']
     team_stats[away]['last_match_date'] = row['date']
+    
+    if row['home_goals'] is not None and row['away_goals'] is not None:
+        h2h_stats[h2h_key_home_away].append((row['home_goals'], row['away_goals']))
+        h2h_stats[h2h_key_away_home].append((row['away_goals'], row['home_goals']))
 
 # Add the new features back into our main dataframe
 df['home_win_rate_diff'] = features['home_win_rate_diff']
@@ -241,7 +270,7 @@ df_clean = df.dropna(subset=['home_win_rate_diff', 'home_gd_diff', 'elo_diff'])
 # --- 4. MACHINE LEARNING TRAINING ---
 print("4. Training the Random Forest Model...")
 # Define our Inputs (X) and Target (y)
-X = df_clean[['home_win_rate_diff', 'home_gd_diff', 'elo_diff', 'rest_days_diff', 'match_importance']]
+X = df_clean[['home_win_rate_diff', 'home_gd_diff', 'elo_diff', 'rest_days_diff', 'match_importance', 'h2h_win_diff', 'h2h_gd_diff']]
 y = df_clean['outcome']
 
 # Split data: 80% for training, 20% for testing to see if the model is actually smart
