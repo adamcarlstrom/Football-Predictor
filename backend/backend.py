@@ -173,6 +173,29 @@ def fetch_and_predict(match_id: int):
     home_stats = get_live_team_stats(home_id)
     away_stats = get_live_team_stats(away_id)
     
+    
+    h2h_res = supabase.table("Matches").select("*").in_("status", ["FT", "AET", "PEN"]).or_(f"and(home_team_id.eq.{home_id},away_team_id.eq.{away_id}),and(home_team_id.eq.{away_id},away_team_id.eq.{home_id})").lt("date", match_date).order("date", desc=True).limit(3).execute()
+    h2h_matches = h2h_res.data
+    
+    if not h2h_matches:
+        live_h2h_win_diff = 0.0
+        live_h2h_gd_diff = 0.0
+    else:
+        h_wins = 0; a_wins = 0; h_goals = 0; a_goals = 0
+        for m in h2h_matches:
+            if m["home_team_id"] == home_id:
+                h_g, a_g = m["home_goals"], m["away_goals"]
+            else:
+                h_g, a_g = m["away_goals"], m["home_goals"]
+                
+            if h_g > a_g: h_wins += 1
+            elif a_g > h_g: a_wins += 1
+            h_goals += h_g
+            a_goals += a_g
+            
+        live_h2h_win_diff = (h_wins - a_wins) / len(h2h_matches)
+        live_h2h_gd_diff = (h_goals - a_goals) / len(h2h_matches)
+    
     home_team_data = supabase.table("Teams").select("current_elo").eq("team_id", home_id).single().execute()
     away_team_data = supabase.table("Teams").select("current_elo").eq("team_id", away_id).single().execute()
     
@@ -204,7 +227,9 @@ def fetch_and_predict(match_id: int):
         'home_gd_diff': live_home_gd_diff,
         'elo_diff': live_elo_diff,
         'rest_days_diff': live_rest_days_diff,
-        'match_importance': live_importance
+        'match_importance': live_importance,
+        'h2h_win_diff': live_h2h_win_diff, 
+        'h2h_gd_diff': live_h2h_gd_diff
     }])
 
     # Ask the Random Forest for the probabilities!
@@ -229,7 +254,7 @@ def fetch_and_predict(match_id: int):
 
     pred_home_goals, pred_away_goals = generate_poisson_scoreline(
         home_prob, draw_prob, away_prob, 
-        home_gf, home_ga, away_gf, away_ga
+        home_gf, home_ga, away_gf, away_ga, h_goals, a_goals
     )
     
     # Map the probabilities to the database payload
@@ -278,6 +303,47 @@ def get_matches_by_date(date: str = None):
 
     # --- 1. THE CACHE CHECK ---
     db_response = fetch_joined_db_data()
+    
+    needs_refresh = False
+    if db_response.data:
+        current_time = datetime.now(timezone.utc)
+        for m in db_response.data:
+            # If match is supposedly Not Started but time has passed...
+            if m["status"] in ["NS", "1H", "2H", "HT"]:
+                # Safely parse ISO date
+                date_str = m["date"].replace("Z", "+00:00")
+                match_time = datetime.fromisoformat(date_str)
+                
+                # If it's > 3 hours past kickoff and < 48 hours ago (respecting API limits)
+                if current_time > (match_time + timedelta(hours=3)) and current_time < (match_time + timedelta(hours=48)):
+                    print(f"Match {m['match_id']} should be finished. Auto-updating...")
+                    try:
+                        up_url = f"https://v3.football.api-sports.io/fixtures?id={m['match_id']}"
+                        headers = {
+                            'x-rapidapi-host': 'v3.football.api-sports.io',
+                            'x-rapidapi-key': FOOTBALL_API_KEY
+                        }
+                        up_res = requests.get(up_url, headers=headers)
+                        up_data = up_res.json()
+                        
+                        if up_data.get("response"):
+                            fix = up_data["response"][0]
+                            new_status = fix["fixture"]["status"]["short"]
+                            # Only update if it actually finished
+                            if new_status in ["FT", "AET", "PEN"]:
+                                supabase.table("Matches").update({
+                                    "status": new_status,
+                                    "home_goals": fix["goals"]["home"],
+                                    "away_goals": fix["goals"]["away"]
+                                }).eq("match_id", m["match_id"]).execute()
+                                needs_refresh = True
+                                print(f"Successfully updated match {m['match_id']} to {new_status} ({fix['goals']['home']}-{fix['goals']['away']})")
+                    except Exception as e:
+                        print(f"Failed to auto-update match {m['match_id']}: {e}")
+                        
+        # If we updated any matches, re-fetch the data so the UI sees the final scores!
+        if needs_refresh:
+            db_response = fetch_joined_db_data()
     
     if db_response.data and len(db_response.data) > 0:
         print(f"CACHE HIT: Serving matches for {target_date_str} from Supabase")
@@ -345,15 +411,17 @@ def get_matches_by_date(date: str = None):
     print(db_response.data)
     return {"matches": db_response.data}
 
-def generate_poisson_scoreline(prob_home, prob_draw, prob_away, home_gf, home_ga, away_gf, away_ga):
+def generate_poisson_scoreline(prob_home, prob_draw, prob_away, home_gf, home_ga, away_gf, away_ga, h_goals, a_goals):
     """
     Translates ML win probabilities and 10-game offensive/defensive form into realistic scorelines.
     """
     # 1. Base Expected Goals (xG) based on 10-game form
     # Home offense vs Away defense
     base_home_xg = (home_gf + away_ga) / 2.0
+    base_home_xg = (base_home_xg +  h_goals) / 2 # Weigh h2h goals more heavily
     # Away offense vs Home defense
     base_away_xg = (away_gf + home_ga) / 2.0
+    base_away_xg = (base_away_xg + a_goals) / 2.0 # Weigh h2h goals more heavily
 
     # 2. Scale by ML Probability (Baseline chance in a 3-way match is ~33.3%)
     # If the model gives them an 80% chance to win, their xG skyrockets.
