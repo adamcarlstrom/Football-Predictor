@@ -59,52 +59,76 @@ def fetch_and_predict(match_id: int):
         'x-rapidapi-host': 'v3.football.api-sports.io',
         'x-rapidapi-key': FOOTBALL_API_KEY
     }
-    
-    print("we will try")
-    try:
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to reach Football API: {str(e)}")
-        
-    if not data.get("response"):
-        raise HTTPException(status_code=404, detail="Match not found in external API")
 
-    # 2. Extract and clean data using a temporary dictionary (or Pandas if processing arrays)
-    fixture_info = data["response"][0]
-    
-    match_details = {
-        "match_id": fixture_info["fixture"]["id"],
-        "date": fixture_info["fixture"]["date"],
-        "home_team_id": fixture_info["teams"]["home"]["id"],
-        "home_team_name": fixture_info["teams"]["home"]["name"],
-        "home_team_logo": fixture_info["teams"]["home"]["logo"],
-        "away_team_id": fixture_info["teams"]["away"]["id"],
-        "away_team_name": fixture_info["teams"]["away"]["name"],
-        "away_team_logo": fixture_info["teams"]["away"]["logo"],
-        "status": fixture_info["fixture"]["status"]["short"], # e.g., 'NS' for Not Started
-        "league_name": fixture_info["league"]["name"]
-    }
+    if not(match_id >= 8000000):
+        print("Match from API")
+        try:
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to reach Football API: {str(e)}")
+            
+        if not data.get("response"):
+            raise HTTPException(status_code=404, detail="Match not found in external API")
 
-    # 3. Cache the teams in Supabase if they don't exist yet to avoid foreign key violations
-    for prefix in ["home", "away"]:
-        supabase.table("Teams").upsert({
-            "team_id": match_details[f"{prefix}_team_id"],
-            "name": match_details[f"{prefix}_team_name"],
-            "logo_url": match_details[f"{prefix}_team_logo"]
+        # 2. Extract and clean data using a temporary dictionary (or Pandas if processing arrays)
+        fixture_info = data["response"][0]
+        print("Match info fetched: ", fixture_info)
+        match_details = {
+            "match_id": fixture_info["fixture"]["id"],
+            "date": fixture_info["fixture"]["date"],
+            "home_team_id": fixture_info["teams"]["home"]["id"],
+            "home_team_name": fixture_info["teams"]["home"]["name"],
+            "home_team_logo": fixture_info["teams"]["home"]["logo"],
+            "away_team_id": fixture_info["teams"]["away"]["id"],
+            "away_team_name": fixture_info["teams"]["away"]["name"],
+            "away_team_logo": fixture_info["teams"]["away"]["logo"],
+            "status": fixture_info["fixture"]["status"]["short"], # e.g., 'NS' for Not Started
+            "league_name": fixture_info["league"]["name"]
+        }
+
+        # 3. Cache the teams in Supabase if they don't exist yet to avoid foreign key violations
+        for prefix in ["home", "away"]:
+            supabase.table("Teams").upsert({
+                "team_id": match_details[f"{prefix}_team_id"],
+                "name": match_details[f"{prefix}_team_name"],
+                "logo_url": match_details[f"{prefix}_team_logo"]
+            }).execute()
+
+        print("Update tabless")
+        # 4. Save/Update the match data in your matches table
+        supabase.table("Matches").upsert({
+            "match_id": match_details["match_id"],
+            "date": match_details["date"],
+            "home_team_id": match_details["home_team_id"],
+            "away_team_id": match_details["away_team_id"],
+            "status": match_details["status"]
         }).execute()
-
-    print("Update tabless")
-    # 4. Save/Update the match data in your matches table
-    supabase.table("Matches").upsert({
-        "match_id": match_details["match_id"],
-        "date": match_details["date"],
-        "home_team_id": match_details["home_team_id"],
-        "away_team_id": match_details["away_team_id"],
-        "status": match_details["status"]
-    }).execute()
-
+    else:
+        # match does not exist within API, only within database...
+        fetched_match = supabase.table("Matches").select(
+            "match_id, date, status, home_goals, away_goals, home_team_id, away_team_id,"
+            "home:Teams!home_team_id(name, logo_url), "
+            "away:Teams!away_team_id(name, logo_url), "
+            "prediction:Predictions(home_win_prob, draw_prob, away_win_prob, predicted_home_goals, predicted_away_goals)"
+        ).eq("league_name","World Cup").eq("match_id", match_id).execute()
+        fetched_match_data = fetched_match.data[0]
+        print(fetched_match_data)
+        match_details = {
+        "match_id": match_id,
+        "date": fetched_match_data["date"],
+        "home_team_id": fetched_match_data["home_team_id"],
+        "home_team_name": fetched_match_data["home"]["name"],
+        "home_team_logo": fetched_match_data["home"]["logo_url"],
+        "away_team_id": fetched_match_data["away_team_id"],
+        "away_team_name": fetched_match_data["away"]["name"],
+        "away_team_logo": fetched_match_data["away"]["logo_url"],
+        "status": fetched_match_data["status"], # e.g., 'NS' for Not Started
+        "league_name": "World Cup"
+        }
+        
+        
     # 5. Placeholder Baseline ML Logic
     # Right now, we will simulate a baseline prediction (e.g., 40% Home Win, 30% Draw, 30% Away Win)
     # This will be replaced by your real scikit-learn model once you train it on historical data.
@@ -359,31 +383,54 @@ def get_matches_by_date(date: str = None):
     Fetches World Cup matches for a specific date. 
     If no date is provided, defaults to today.
     """
-    # 1. Determine the target date
     if date:
         target_date_str = date
     else:
         target_date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        
     target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
     start_of_window = (target_dt - timedelta(days=1)).strftime("%Y-%m-%dT22:00:00+00:00")
     end_of_window = (target_dt ).strftime("%Y-%m-%dT22:00:00+00:00")
 
-    
-
     # --- 1. THE CACHE CHECK ---
     db_response = fetch_joined_db_data(start_of_window,end_of_window)
     
+    # --- 1.5 THE DUPLICATE SWEEPER ---
+    if db_response.data:
+        seen_matchups = {}
+        duplicates_to_delete = []
+
+        for m in db_response.data:
+            # Sort names to create a unique identifier regardless of who is home vs away
+            matchup_key = tuple(sorted([m["home"]["name"], m["away"]["name"]]))
+            
+            if matchup_key in seen_matchups:
+                existing_match = seen_matchups[matchup_key]
+                # Compare match IDs. Mark the HIGHER ID (fake one) for deletion
+                if m["match_id"] > existing_match["match_id"]:
+                    duplicates_to_delete.append(m["match_id"])
+                else:
+                    duplicates_to_delete.append(existing_match["match_id"])
+                    seen_matchups[matchup_key] = m  # Keep the lower ID in our verified list
+            else:
+                seen_matchups[matchup_key] = m
+
+        if duplicates_to_delete:
+            print(f"Sweeping {len(duplicates_to_delete)} duplicate fake matches from database...")
+            for bad_id in duplicates_to_delete:
+                supabase.table("Predictions").delete().eq("match_id", bad_id).execute()
+                supabase.table("Matches").delete().eq("match_id", bad_id).execute()
+            # Refetch clean data after sweeping
+            db_response = fetch_joined_db_data(start_of_window, end_of_window)
+
     needs_refresh = False
     if db_response.data:
         current_time = datetime.now(timezone.utc)
         for m in db_response.data:
-            # If match is supposedly Not Started but time has passed...
             if m["status"] in ["NS", "1H", "2H", "HT"]:
-                # Safely parse ISO date
                 date_str = m["date"].replace("Z", "+00:00")
                 match_time = datetime.fromisoformat(date_str)
                 
-                # If it's > 3 hours past kickoff and < 48 hours ago (respecting API limits)
                 if current_time > (match_time + timedelta(hours=3)) and current_time < (match_time + timedelta(hours=48)):
                     print(f"Match {m['match_id']} should be finished. Auto-updating...")
                     try:
@@ -398,7 +445,6 @@ def get_matches_by_date(date: str = None):
                         if up_data.get("response"):
                             fix = up_data["response"][0]
                             new_status = fix["fixture"]["status"]["short"]
-                            # Only update if it actually finished
                             if new_status in ["FT", "AET", "PEN"]:
                                 supabase.table("Matches").update({
                                     "status": new_status,
@@ -410,17 +456,33 @@ def get_matches_by_date(date: str = None):
                     except Exception as e:
                         print(f"Failed to auto-update match {m['match_id']}: {e}")
                         
-        # If we updated any matches, re-fetch the data so the UI sees the final scores!
         if needs_refresh:
             db_response = fetch_joined_db_data(start_of_window,end_of_window)
+
+    # --- 1.6 THE HORIZON SYNC (Check for Tomorrow's Real Games) ---
+    current_date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    current_dt = datetime.strptime(current_date_str, "%Y-%m-%d")
     
-    if db_response.data and len(db_response.data) > 0:
+    # Is the requested date today or tomorrow or yesterday?
+    is_horizon = (target_dt == current_dt) or (target_dt == current_dt + timedelta(days=1)) or (target_dt == current_dt - timedelta(days=1)) 
+    
+    # Are there fake matches sitting in the database for this date?
+    has_fakes = any(m["match_id"] >= 8000000 for m in db_response.data) if db_response.data else False
+    
+    # If it's today/tomorrow AND we have fakes, ignore the local DB and force an API fetch!
+    force_api_sync = is_horizon and has_fakes
+
+    if db_response.data and len(db_response.data) > 0 and not force_api_sync:
         print(f"CACHE HIT: Serving matches for {target_date_str} from Supabase")
-        print(db_response.data)
+        # print(db_response.data)
         return {"matches": db_response.data}
 
-    # --- 2. CACHE MISS: Fetch from API ---
-    print(f"CACHE MISS: Fetching Matches for {target_date_str} from API-Football")
+    # --- 2. CACHE MISS OR HORIZON SYNC: Fetch from API ---
+    if force_api_sync:
+        print(f"FAKE MATCHES DETECTED for {target_date_str}. Forcing API sync to replace them...")
+    else:
+        print(f"CACHE MISS: Fetching Matches for {target_date_str} from API-Football")
+    
     url = f"https://v3.football.api-sports.io/fixtures?date={target_date_str}&timezone=Europe/Stockholm"
     headers = {
         'x-rapidapi-host': 'v3.football.api-sports.io',
@@ -433,6 +495,7 @@ def get_matches_by_date(date: str = None):
         data = response.json()
     except Exception as e:
         raise HTTPException(status_code=500, detail="Failed to fetch matches for date")
+        
     print("Here comes new data: " ,data)
     if(data == []):
         try:
@@ -440,23 +503,32 @@ def get_matches_by_date(date: str = None):
             response.raise_for_status()
             data = response.json()
             
-            # --- NEW DEBUG BLOCK ---
             print(f"\n--- API DATA FOR {target_date_str} ---")
             found_leagues = set()
             for fix in data.get("response", []):
                 found_leagues.add(fix["league"]["name"])
             print(f"Leagues playing on this date: {found_leagues}")
-            # -----------------------
             
         except Exception as e:
             raise HTTPException(status_code=500, detail="Failed to fetch matches for date")
     
-    # --- 3. SAVE THE NEW DATA ---
+    # --- 3. SAVE THE NEW DATA & PRUNE FAKES ---
     for fixture in data.get("response", []):
         if fixture["league"]["name"] == 'World Cup':
             match_id = fixture["fixture"]["id"]
             home_team = fixture["teams"]["home"]
             away_team = fixture["teams"]["away"]
+            
+            # FAKE MATCH RECONCILIATION
+            try:
+                fake_match_check = supabase.table("Matches").select("match_id").eq("home_team_id", home_team["id"]).eq("away_team_id", away_team["id"]).gte("match_id", 8000000).execute()
+                if fake_match_check.data:
+                    for fm in fake_match_check.data:
+                        print(f"Purging fake match {fm['match_id']} and replacing with real API match {match_id}")
+                        supabase.table("Predictions").delete().eq("match_id", fm['match_id']).execute()
+                        supabase.table("Matches").delete().eq("match_id", fm['match_id']).execute()
+            except Exception as e:
+                print(f"Error purging fake matches: {e}")
             
             for team in [home_team, away_team]:
                 supabase.table("Teams").upsert({
@@ -478,7 +550,7 @@ def get_matches_by_date(date: str = None):
 
     # --- 4. RETURN RE-FETCHED DATA ---
     db_response = fetch_joined_db_data(start_of_window,end_of_window)
-    print(db_response.data)
+    # print(db_response.data)
     return {"matches": db_response.data}
 
 def generate_poisson_scoreline(prob_home, prob_draw, prob_away, home_gf, home_ga, away_gf, away_ga, h2h_home_gf=None, h2h_away_gf=None):
