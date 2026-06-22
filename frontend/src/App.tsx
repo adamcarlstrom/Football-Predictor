@@ -21,6 +21,7 @@ export default function App() {
   const [matches, setMatches] = useState<DashboardMatch[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [predictingId, setPredictingId] = useState<number | null>(null);
+  const [isSyncing, setIsSyncing] = useState<boolean>(false);
   
   // State to track the currently selected date (Defaults to today in YYYY-MM-DD format)
   const [selectedDate, setSelectedDate] = useState<string>(new Date().toISOString().split('T')[0]);
@@ -66,11 +67,26 @@ export default function App() {
     }
   };
 
+  const reloadAPICall = async () => {
+    setIsSyncing(true);
+    try {
+      console.log("Forcing API sync to fetch missing matches")
+      await fetch(`http://127.0.0.1:8000/api/api_update_call?date=${selectedDate}`, {
+        cache: 'no-store'
+      });
+      await fetchMatches(selectedDate); // Refresh current date's view
+    } catch (err) {
+      console.error("API Update failed", err);
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
   return (
     <div style={{width: '100vw', fontFamily: 'system-ui, sans-serif', backgroundColor: '#f8f9fa', minHeight: '100vh', padding: '40px 20px' }}>
       
       {/* HEADER & DATE CONTROLS */}
-      <div style={{ maxWidth: '800px', margin: '0 auto', marginBottom: '40px' }}>
+      <div style={{ maxWidth: '1000px', margin: '0 auto', marginBottom: '40px' }}>
         <h1 style={{ textAlign: 'center', color: '#2c3e50', marginBottom: '20px' }}>World Cup Match Predictor</h1>
         
         <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '15px', backgroundColor: '#fff', padding: '15px', borderRadius: '12px', boxShadow: '0 4px 12px rgba(0,0,0,0.05)', border: '1px solid #eaeaea' }}>
@@ -82,11 +98,17 @@ export default function App() {
             onChange={(e) => setSelectedDate(e.target.value)}
             style={{ padding: '10px', borderRadius: '8px', border: '1px solid #bdc3c7', fontSize: '16px', outline: 'none', cursor: 'pointer' }}
           />
+          <button 
+          onClick={() => reloadAPICall()}
+          style={{padding: '12px', backgroundColor: '#2980b9', color: 'white', border: 'none', borderRadius: '8px', cursor: 'pointer', fontWeight: 'bold', fontSize: '14px' }}
+        >
+          Reload API Call
+        </button>
         </div>
       </div>
       
       {/* MATCH FEED */}
-      <div style={{ maxWidth: '800px', margin: '0 auto' }}>
+      <div style={{ maxWidth: '1000px', margin: '0 auto' }}>
         {isLoading ? (
           <div style={{ textAlign: 'center', color: '#7f8c8d' }}>Loading matches for {selectedDate}...</div>
         ) : matches.length === 0 ? (
@@ -94,7 +116,8 @@ export default function App() {
             No World Cup matches found on {selectedDate}.
           </div>
         ) : (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(350px, 1fr))', gap: '20px' }}>
+            {/* NEW: CSS Grid layout for 2+ cards per row */}
             {matches.map(match => {
               let pred: any = null;
               if (Array.isArray(match.prediction) && match.prediction.length > 0) {
@@ -105,13 +128,18 @@ export default function App() {
               const isUpcoming = match.status === 'NS';
               const homeScore = match.home_goals !== null ? match.home_goals : '0';
               const awayScore = match.away_goals !== null ? match.away_goals : '0';
+              
+              // NEW: Extract clean local time from ISO string
+              const matchTime = new Date(match.date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
               return (
                 <div key={match.match_id} style={{ backgroundColor: '#fff', padding: '20px', borderRadius: '12px', boxShadow: '0 4px 12px rgba(0,0,0,0.05)', border: '1px solid #eaeaea' }}>
                   
-                  {/* Match Status Header */}
+                  {/* Match Status & Time Header */}
                   <div style={{ textAlign: 'center', marginBottom: '15px', fontSize: '12px', fontWeight: 'bold', color: isUpcoming ? '#95a5a6' : '#e74c3c', textTransform: 'uppercase' }}>
                     {isUpcoming ? 'Upcoming' : match.status === 'FT' || match.status === 'PEN' ? 'Full Time' : `Live: ${match.status}`}
+                    <span style={{ margin: '0 8px', color: '#bdc3c7' }}>•</span>
+                    <span style={{ color: '#34495e' }}>{matchTime}</span>
                   </div>
 
                   {/* Teams and Actual Scoreline */}
@@ -137,7 +165,6 @@ export default function App() {
                       <div style={{ fontSize: '14px', textAlign: 'center' }}>
                         <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '10px', color: '#7f8c8d', marginBottom: '8px', fontSize: '12px', textTransform: 'uppercase', letterSpacing: '1px' }}>
                           <span>AI Prediction</span>
-                          {/* NEW: Display the Poisson Predicted Goals */}
                           <span style={{ backgroundColor: '#2c3e50', color: '#fff', padding: '3px 8px', borderRadius: '12px', fontWeight: 'bold' }}>
                             Score: {pred.predicted_home_goals} - {pred.predicted_away_goals}
                           </span>

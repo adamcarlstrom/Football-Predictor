@@ -279,7 +279,80 @@ def fetch_and_predict(match_id: int):
         "match_info": match_details,
         "prediction": prediction_data
     }
+
+# Helper function to grab the fully joined data from Supabase
+def fetch_joined_db_data(start_of_window,end_of_window):
+    return supabase.table("Matches").select(
+        "match_id, date, status, home_goals, away_goals, "
+        "home:Teams!home_team_id(name, logo_url), "
+        "away:Teams!away_team_id(name, logo_url), "
+        "prediction:Predictions(home_win_prob, draw_prob, away_win_prob, predicted_home_goals, predicted_away_goals)"
+    ).eq("league_name","World Cup").gte("date", start_of_window).lte("date", end_of_window).order("date").execute()
+
+@app.get("/api/api_update_call")
+def get_api_update_call(date:str = None):
+    if date:
+        target_date_str = date
+    else:
+        target_date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     
+    print("Update API call for date: ",date)
+    url = f"https://v3.football.api-sports.io/fixtures?date={target_date_str}&timezone=Europe/Stockholm"
+    headers = {
+        'x-rapidapi-host': 'v3.football.api-sports.io',
+        'x-rapidapi-key': FOOTBALL_API_KEY
+    }
+    
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Failed to fetch matches for date")
+    print("Here comes new data: " ,data)
+    if(data == []):
+        try:
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            
+            # --- NEW DEBUG BLOCK ---
+            print(f"\n--- API DATA FOR {target_date_str} ---")
+            found_leagues = set()
+            for fix in data.get("response", []):
+                found_leagues.add(fix["league"]["name"])
+            print(f"Leagues playing on this date: {found_leagues}")
+            # -----------------------
+            
+        except Exception as e:
+            raise HTTPException(status_code=500, detail="Failed to fetch matches for date")
+    
+    # --- 3. SAVE THE NEW DATA ---
+    for fixture in data.get("response", []):
+        if fixture["league"]["name"] == 'World Cup':
+            match_id = fixture["fixture"]["id"]
+            home_team = fixture["teams"]["home"]
+            away_team = fixture["teams"]["away"]
+            
+            for team in [home_team, away_team]:
+                supabase.table("Teams").upsert({
+                    "team_id": team["id"],
+                    "name": team["name"],
+                    "logo_url": team["logo"]
+                }).execute()
+
+            supabase.table("Matches").upsert({
+                "match_id": match_id,
+                "date": fixture["fixture"]["date"],
+                "home_team_id": home_team["id"],
+                "away_team_id": away_team["id"],
+                "status": fixture["fixture"]["status"]["short"],
+                "home_goals": fixture["goals"]["home"], 
+                "away_goals": fixture["goals"]["away"],
+                "league_name": fixture["league"]["name"]
+            }).execute()
+    return {"status": "success", "message": f"Successfully pulled and saved matches for {target_date_str}"}
+
 @app.get("/api/matches")
 def get_matches_by_date(date: str = None):
     """
@@ -292,22 +365,13 @@ def get_matches_by_date(date: str = None):
     else:
         target_date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
-    start_of_window = f"{target_date_str}T00:00:00+00:00"
-    end_of_window = (target_dt + timedelta(days=1)).strftime("%Y-%m-%dT12:00:00+00:00")    
-    start_of_day = f"{target_date_str}T00:00:00Z"
-    end_of_day = f"{target_date_str}T23:59:59Z"
+    start_of_window = (target_dt - timedelta(days=1)).strftime("%Y-%m-%dT22:00:00+00:00")
+    end_of_window = (target_dt ).strftime("%Y-%m-%dT22:00:00+00:00")
 
-    # Helper function to grab the fully joined data from Supabase
-    def fetch_joined_db_data():
-        return supabase.table("Matches").select(
-            "match_id, date, status, home_goals, away_goals, "
-            "home:Teams!home_team_id(name, logo_url), "
-            "away:Teams!away_team_id(name, logo_url), "
-            "prediction:Predictions(home_win_prob, draw_prob, away_win_prob, predicted_home_goals, predicted_away_goals)"
-        ).eq("league_name","World Cup").gte("date", start_of_window).lte("date", end_of_window).order("date").execute()
+    
 
     # --- 1. THE CACHE CHECK ---
-    db_response = fetch_joined_db_data()
+    db_response = fetch_joined_db_data(start_of_window,end_of_window)
     
     needs_refresh = False
     if db_response.data:
@@ -348,15 +412,16 @@ def get_matches_by_date(date: str = None):
                         
         # If we updated any matches, re-fetch the data so the UI sees the final scores!
         if needs_refresh:
-            db_response = fetch_joined_db_data()
+            db_response = fetch_joined_db_data(start_of_window,end_of_window)
     
     if db_response.data and len(db_response.data) > 0:
         print(f"CACHE HIT: Serving matches for {target_date_str} from Supabase")
+        print(db_response.data)
         return {"matches": db_response.data}
 
     # --- 2. CACHE MISS: Fetch from API ---
     print(f"CACHE MISS: Fetching Matches for {target_date_str} from API-Football")
-    url = f"https://v3.football.api-sports.io/fixtures?date={target_date_str}&timezone=America/New_York"
+    url = f"https://v3.football.api-sports.io/fixtures?date={target_date_str}&timezone=Europe/Stockholm"
     headers = {
         'x-rapidapi-host': 'v3.football.api-sports.io',
         'x-rapidapi-key': FOOTBALL_API_KEY
@@ -412,7 +477,7 @@ def get_matches_by_date(date: str = None):
             }).execute()
 
     # --- 4. RETURN RE-FETCHED DATA ---
-    db_response = fetch_joined_db_data()
+    db_response = fetch_joined_db_data(start_of_window,end_of_window)
     print(db_response.data)
     return {"matches": db_response.data}
 
