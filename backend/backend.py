@@ -180,6 +180,8 @@ def fetch_and_predict(match_id: int):
     if not h2h_matches:
         live_h2h_win_diff = 0.0
         live_h2h_gd_diff = 0.0
+        h2h_home_gf_avg = None
+        h2h_away_gf_avg = None
     else:
         h_wins = 0; a_wins = 0; h_goals = 0; a_goals = 0
         for m in h2h_matches:
@@ -195,6 +197,9 @@ def fetch_and_predict(match_id: int):
             
         live_h2h_win_diff = (h_wins - a_wins) / len(h2h_matches)
         live_h2h_gd_diff = (h_goals - a_goals) / len(h2h_matches)
+        
+        h2h_home_gf_avg = h_goals / len(h2h_matches)
+        h2h_away_gf_avg = a_goals / len(h2h_matches)
     
     home_team_data = supabase.table("Teams").select("current_elo").eq("team_id", home_id).single().execute()
     away_team_data = supabase.table("Teams").select("current_elo").eq("team_id", away_id).single().execute()
@@ -254,7 +259,7 @@ def fetch_and_predict(match_id: int):
 
     pred_home_goals, pred_away_goals = generate_poisson_scoreline(
         home_prob, draw_prob, away_prob, 
-        home_gf, home_ga, away_gf, away_ga, h_goals, a_goals
+        home_gf, home_ga, away_gf, away_ga, h2h_home_gf_avg, h2h_away_gf_avg
     )
     
     # Map the probabilities to the database payload
@@ -411,17 +416,21 @@ def get_matches_by_date(date: str = None):
     print(db_response.data)
     return {"matches": db_response.data}
 
-def generate_poisson_scoreline(prob_home, prob_draw, prob_away, home_gf, home_ga, away_gf, away_ga, h_goals, a_goals):
+def generate_poisson_scoreline(prob_home, prob_draw, prob_away, home_gf, home_ga, away_gf, away_ga, h2h_home_gf=None, h2h_away_gf=None):
     """
     Translates ML win probabilities and 10-game offensive/defensive form into realistic scorelines.
     """
     # 1. Base Expected Goals (xG) based on 10-game form
     # Home offense vs Away defense
     base_home_xg = (home_gf + away_ga) / 2.0
-    base_home_xg = (base_home_xg +  h_goals) / 2 # Weigh h2h goals more heavily
+    # base_home_xg = (base_home_xg +  h2h_home_goals) / 2 # Weigh h2h goals more heavily
     # Away offense vs Home defense
     base_away_xg = (away_gf + home_ga) / 2.0
-    base_away_xg = (base_away_xg + a_goals) / 2.0 # Weigh h2h goals more heavily
+    # base_away_xg = (base_away_xg + h2h_away_goals) / 2.0 # Weigh h2h goals more heavily
+    
+    if h2h_home_gf is not None and h2h_away_gf is not None:
+        base_home_xg = (base_home_xg + h2h_home_gf) / 2.0
+        base_away_xg = (base_away_xg + h2h_away_gf) / 2.0
 
     # 2. Scale by ML Probability (Baseline chance in a 3-way match is ~33.3%)
     # If the model gives them an 80% chance to win, their xG skyrockets.
