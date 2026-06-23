@@ -132,7 +132,6 @@ export default function App() {
   // --- RENDER HELPERS ---
   const renderDailyFeed = () => (
     <>
-    
       <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '15px', backgroundColor: '#fff', padding: '15px', borderRadius: '12px', boxShadow: '0 4px 12px rgba(0,0,0,0.05)', border: '1px solid #eaeaea', flexWrap: 'wrap', marginBottom: '40px' }}>
         <label htmlFor="date-picker" style={{ fontWeight: 'bold', color: '#34495e' }}>Select Match Day:</label>
         <input id="date-picker" type="date" value={selectedDate} onChange={(e) => setSelectedDate(e.target.value)} style={{ padding: '10px', borderRadius: '8px', border: '1px solid #bdc3c7', fontSize: '16px', outline: 'none', cursor: 'pointer' }} />
@@ -270,7 +269,7 @@ export default function App() {
 
   return (
     <div style={{width: '100vw', fontFamily: 'system-ui, sans-serif', backgroundColor: '#f8f9fa', minHeight: '100vh', padding: '40px 20px' }}>
-      <div style={{width: '100%',margin: '0 auto', marginBottom: '20px' }}>
+      <div style={{ maxWidth: '1200px', margin: '0 auto', marginBottom: '20px' }}>
         <h1 style={{ textAlign: 'center', color: '#2c3e50', marginBottom: '30px' }}>AI World Cup Simulator</h1>
         
         {/* TAB NAVIGATION */}

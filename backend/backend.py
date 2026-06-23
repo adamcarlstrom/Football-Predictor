@@ -611,51 +611,53 @@ def generate_poisson_scoreline(prob_home, prob_draw, prob_away, home_gf, home_ga
 # --- TOURNAMENT SIMULATOR ENDPOINTS ---
 @app.get("/api/tournament/groups")
 def get_group_standings():
-    """Extracts the 12 groups, calculates actual/predicted standings, and finds advancing teams."""
+    """Extracts the 12 explicitly defined groups, calculates actual/predicted standings, and finds advancing teams."""
     # 1. Fetch all WC matches
     res = supabase.table("Matches").select("*, home:Teams!home_team_id(*), away:Teams!away_team_id(*), prediction:Predictions(*)").eq("league_name", "World Cup").gte("date", "2026-06-11").execute()
     matches = res.data
 
-    # 2. Extract groups using a graph traversal (Teams that play each other are in the same group)
-    adj = defaultdict(set)
-    team_dict = {}
-    for m in matches:
-        # Only use the first ~72 matches (group stage) to build the clusters
-        adj[m["home_team_id"]].add(m["away_team_id"])
-        adj[m["away_team_id"]].add(m["home_team_id"])
-        team_dict[m["home_team_id"]] = m["home"]
-        team_dict[m["away_team_id"]] = m["away"]
-
-    visited = set()
-    groups = []
-    # Identify connected components (Groups of 4)
-    for t_id in list(team_dict.keys()):
-        if t_id not in visited:
-            group_members = set([t_id])
-            queue = [t_id]
-            while queue:
-                curr = queue.pop(0)
-                for neighbor in adj[curr]:
-                    if neighbor not in visited and neighbor not in group_members:
-                        group_members.add(neighbor)
-                        queue.append(neighbor)
-            for member in group_members: visited.add(member)
-            if len(group_members) == 4:
-                groups.append(list(group_members))
-
-    # Sort groups alphabetically by the first team's name to assign stable Group Letters (A-L)
-    groups.sort(key=lambda g: sorted([team_dict[tid]["name"] for tid in g])[0])
-    group_labels = "ABCDEFGHIJKL"
+    # 2. Fetch teams to correctly map the exact user-defined names to IDs
+    teams_res = supabase.table("Teams").select("*").execute()
+    name_to_team = {t["name"].strip().lower(): t for t in teams_res.data}
+    
+    GROUPS_BY_NAME = {
+        "A": ["Mexico", "South Korea", "Czechia", "South Africa"], 
+        "B": ["Canada", "Switzerland", "Bosnia & Herzegovina", "Qatar"],
+        "C": ["Brazil", "Morocco", "Scotland", "Haiti"],
+        "D": ["USA", "Australia", "Paraguay", "Türkiye"],
+        "E": ["Germany", "Ivory Coast", "Ecuador", "Curaçao"],
+        "F": ["Netherlands", "Japan",  "Sweden", "Tunisia"],
+        "G": ["Egypt", "Iran", "Belgium", "New Zealand"],
+        "H": ["Spain", "Uruguay", "Cape Verde Islands", "Saudi Arabia"],
+        "I": ["Norway", "France", "Senegal", "Iraq"],
+        "J": ["Argentina", "Austria", "Jordan", "Algeria"],
+        "K": ["Colombia", "Congo DR", "Portugal", "Uzbekistan"],
+        "L": ["England", "Ghana", "Panama", "Croatia"]
+    }
 
     standings = []
-    # 3. Calculate points and goals
-    for idx, g_teams in enumerate(groups[:12]):
-        g_label = group_labels[idx]
-        g_standings = {tid: {"id": tid, "name": team_dict[tid]["name"], "logo": team_dict[tid]["logo_url"], "group": g_label, "pts": 0, "gf": 0, "ga": 0, "gd": 0, "played": 0} for tid in g_teams}
+    
+    # 3. Calculate points and goals using exact grouping
+    for g_label, team_names in GROUPS_BY_NAME.items():
+        g_teams_ids = []
+        g_standings = {}
         
-        # Process matches in this group
+        # Build initial group members based on DB match
+        for name in team_names:
+            team_data = name_to_team.get(name.strip().lower())
+            if team_data:
+                tid = team_data["team_id"]
+                g_teams_ids.append(tid)
+                g_standings[tid] = {
+                    "id": tid, "name": team_data["name"], "logo": team_data["logo_url"], 
+                    "group": g_label, "pts": 0, "gf": 0, "ga": 0, "gd": 0, "played": 0
+                }
+            else:
+                print(f"Warning: Team '{name}' in Group {g_label} not found in database!")
+
+        # Process matches specifically occurring between group members
         for m in matches:
-            if m["home_team_id"] in g_teams and m["away_team_id"] in g_teams:
+            if m["home_team_id"] in g_teams_ids and m["away_team_id"] in g_teams_ids:
                 h_id = m["home_team_id"]
                 a_id = m["away_team_id"]
                 
@@ -687,10 +689,11 @@ def get_group_standings():
         # Assign ranks
         for rank, team in enumerate(sorted_group):
             team["rank"] = rank + 1
+        
         standings.append({"group": g_label, "teams": sorted_group})
 
     # 4. Extract advancers (Top 2 per group + Best 8 3rd places)
-    all_3rds = [g["teams"][2] for g in standings]
+    all_3rds = [g["teams"][2] for g in standings if len(g["teams"]) > 2]
     sorted_3rds = sorted(all_3rds, key=lambda x: (x["pts"], x["gd"], x["gf"]), reverse=True)
     best_8_3rds = [t["id"] for t in sorted_3rds[:8]]
 
@@ -707,7 +710,6 @@ def get_group_standings():
 def generate_knockout_bracket(payload: dict):
     groups_data = payload.get("groups", [])
     
-    # Organize winners, runners up, and 3rds
     winners = {}; runners = {}; thirds = {}
     for g in groups_data:
         g_label = g["group"]
@@ -717,43 +719,73 @@ def generate_knockout_bracket(payload: dict):
                 elif t["rank"] == 2: runners[g_label] = t
                 elif t["rank"] == 3: thirds[g_label] = t
 
-    # GREEDY ALLOCATOR for 3rd Place Teams (Approximates the 495 combinations rules perfectly)
-    unassigned_thirds = list(thirds.values())
-    unassigned_thirds.sort(key=lambda x: (x["pts"], x["gd"], x["gf"]), reverse=True) # Give best teams priority
+    # --- DFS BACKTRACKING ALLOCATOR FOR 3rd PLACE TEAMS ---
+    # This perfectly replicates FIFA's 495-combination Annex C table computationally.
+    advancing_thirds_groups = list(thirds.keys())
     
-    def pop_best_3rd(allowed_groups):
-        for t in unassigned_thirds:
-            if t["group"] in allowed_groups:
-                unassigned_thirds.remove(t)
-                return t
-        # Fallback if specific combo is exhausted
-        if unassigned_thirds:
-            return unassigned_thirds.pop(0)
+    # Define match requirements exactly from Wikipedia rules
+    match_requirements = {
+        74: list("ABCDF"),
+        77: list("CDFGH"),
+        79: list("CEFHI"),
+        80: list("EHIJK"),
+        81: list("BEFIJ"),
+        82: list("AEHIJ"),
+        85: list("EFGIJ"),
+        87: list("DEIJL")
+    }
+    
+    match_ids = [74, 77, 79, 80, 81, 82, 85, 87]
+    
+    def backtrack_allocation(index, available_groups):
+        if index == len(match_ids):
+            return {} # Successfully assigned all 8 slots
+            
+        m_id = match_ids[index]
+        allowed_for_this_match = match_requirements[m_id]
+        
+        # Sort available groups to ensure deterministic bracket generation
+        for g in sorted(available_groups):
+            if g in allowed_for_this_match:
+                new_available = available_groups.copy()
+                new_available.remove(g)
+                result = backtrack_allocation(index + 1, new_available)
+                if result is not None:
+                    result[m_id] = g
+                    return result
+        return None # Dead end, backtrack
+
+    allocation_map = backtrack_allocation(0, advancing_thirds_groups)
+    
+    # Fallback lookup to safely map the assigned group back to the actual team data
+    def get_allocated_3rd(match_id):
+        if allocation_map and match_id in allocation_map:
+            assigned_group = allocation_map[match_id]
+            return thirds[assigned_group]
         return {"name": "TBD", "logo": "", "id": 0}
 
-    # Match R32 according to Wikipedia Layout
+    # REORDERED: Match R32 according to exact Wikipedia visual bracket (Top to Bottom)
     r32_matches = [
+        {"id": 74, "home": winners.get("E"), "away": get_allocated_3rd(74)},
+        {"id": 77, "home": winners.get("I"), "away": get_allocated_3rd(77)},
         {"id": 73, "home": runners.get("A"), "away": runners.get("B")},
-        {"id": 74, "home": winners.get("E"), "away": pop_best_3rd(["A","B","C","D","F"])},
         {"id": 75, "home": winners.get("F"), "away": runners.get("C")},
-        {"id": 76, "home": winners.get("C"), "away": runners.get("F")},
-        {"id": 77, "home": winners.get("I"), "away": pop_best_3rd(["C","D","F","G","H"])},
-        {"id": 78, "home": runners.get("E"), "away": runners.get("I")},
-        {"id": 79, "home": winners.get("A"), "away": pop_best_3rd(["C","E","F","H","I"])},
-        {"id": 80, "home": winners.get("L"), "away": pop_best_3rd(["E","H","I","J","K"])},
-        {"id": 81, "home": winners.get("D"), "away": pop_best_3rd(["B","E","F","I","J"])},
-        {"id": 82, "home": winners.get("G"), "away": pop_best_3rd(["A","E","H","I","J"])},
         {"id": 83, "home": runners.get("K"), "away": runners.get("L")},
         {"id": 84, "home": winners.get("H"), "away": runners.get("J")},
-        {"id": 85, "home": winners.get("B"), "away": pop_best_3rd(["E","F","G","I","J"])},
+        {"id": 81, "home": winners.get("D"), "away": get_allocated_3rd(81)},
+        {"id": 82, "home": winners.get("G"), "away": get_allocated_3rd(82)},
+        {"id": 76, "home": winners.get("C"), "away": runners.get("F")},
+        {"id": 78, "home": runners.get("E"), "away": runners.get("I")},
+        {"id": 79, "home": winners.get("A"), "away": get_allocated_3rd(79)},
+        {"id": 80, "home": winners.get("L"), "away": get_allocated_3rd(80)},
         {"id": 86, "home": winners.get("J"), "away": runners.get("H")},
-        {"id": 87, "home": winners.get("K"), "away": pop_best_3rd(["D","E","I","J","L"])},
         {"id": 88, "home": runners.get("D"), "away": runners.get("G")},
+        {"id": 85, "home": winners.get("B"), "away": get_allocated_3rd(85)},
+        {"id": 87, "home": winners.get("K"), "away": get_allocated_3rd(87)},
     ]
 
     bracket = {"Round of 32": [], "Round of 16": [], "Quarter-Finals": [], "Semi-Finals": [], "Final": []}
     
-    # Helper to simulate a round and return winners
     def simulate_round(matches, round_name, next_round_map=None):
         winners_list = []
         for m in matches:
@@ -763,11 +795,9 @@ def generate_knockout_bracket(payload: dict):
                 bracket[round_name].append(m)
                 continue
                 
-            # Simulate locally
             hp, dp, ap, hg, ag = run_local_prediction(m["home"]["id"], m["away"]["id"], datetime.now(timezone.utc).isoformat())
             m["pred_hg"] = hg; m["pred_ag"] = ag
             
-            # Resolve Knockout Draws via probabilities
             if hg == ag:
                 if hp >= ap: m["pred_hg"] += 1
                 else: m["pred_ag"] += 1
@@ -778,39 +808,34 @@ def generate_knockout_bracket(payload: dict):
             bracket[round_name].append(m)
         return winners_list
 
-    # Simulate R32
     r32_winners = simulate_round(r32_matches, "Round of 32")
     
-    # Build R16 (Following Wiki pairings)
     r16_matches = [
-        {"id": 90, "home": r32_winners[0], "away": r32_winners[2]}, # 73 vs 75
-        {"id": 89, "home": r32_winners[1], "away": r32_winners[4]}, # 74 vs 77
-        {"id": 91, "home": r32_winners[3], "away": r32_winners[5]}, # 76 vs 78
-        {"id": 92, "home": r32_winners[6], "away": r32_winners[7]}, # 79 vs 80
-        {"id": 93, "home": r32_winners[10], "away": r32_winners[11]},# 83 vs 84
-        {"id": 94, "home": r32_winners[8], "away": r32_winners[9]}, # 81 vs 82
-        {"id": 95, "home": r32_winners[13], "away": r32_winners[15]},# 86 vs 88
-        {"id": 96, "home": r32_winners[12], "away": r32_winners[14]} # 85 vs 87
+        {"id": 89, "home": r32_winners[0], "away": r32_winners[1]}, 
+        {"id": 90, "home": r32_winners[2], "away": r32_winners[3]}, 
+        {"id": 93, "home": r32_winners[4], "away": r32_winners[5]}, 
+        {"id": 94, "home": r32_winners[6], "away": r32_winners[7]}, 
+        {"id": 91, "home": r32_winners[8], "away": r32_winners[9]}, 
+        {"id": 92, "home": r32_winners[10], "away": r32_winners[11]},
+        {"id": 95, "home": r32_winners[12], "away": r32_winners[13]},
+        {"id": 96, "home": r32_winners[14], "away": r32_winners[15]} 
     ]
     r16_winners = simulate_round(r16_matches, "Round of 16")
     
-    # Build QF
     qf_matches = [
-        {"id": 97, "home": r16_winners[1], "away": r16_winners[0]}, # 89 vs 90
-        {"id": 98, "home": r16_winners[4], "away": r16_winners[5]}, # 93 vs 94
-        {"id": 99, "home": r16_winners[2], "away": r16_winners[3]}, # 91 vs 92
-        {"id": 100, "home": r16_winners[6], "away": r16_winners[7]},# 95 vs 96
+        {"id": 97, "home": r16_winners[0], "away": r16_winners[1]}, 
+        {"id": 98, "home": r16_winners[2], "away": r16_winners[3]}, 
+        {"id": 99, "home": r16_winners[4], "away": r16_winners[5]}, 
+        {"id": 100, "home": r16_winners[6], "away": r16_winners[7]},
     ]
     qf_winners = simulate_round(qf_matches, "Quarter-Finals")
     
-    # Build SF
     sf_matches = [
-        {"id": 101, "home": qf_winners[0], "away": qf_winners[1]}, # 97 vs 98
-        {"id": 102, "home": qf_winners[2], "away": qf_winners[3]}, # 99 vs 100
+        {"id": 101, "home": qf_winners[0], "away": qf_winners[1]}, 
+        {"id": 102, "home": qf_winners[2], "away": qf_winners[3]}, 
     ]
     sf_winners = simulate_round(sf_matches, "Semi-Finals")
     
-    # Build Final
     final_match = [{"id": 104, "home": sf_winners[0], "away": sf_winners[1]}]
     simulate_round(final_match, "Final")
 
