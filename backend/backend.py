@@ -1,3 +1,4 @@
+from collections import defaultdict
 import os
 import requests
 import math
@@ -605,3 +606,310 @@ def generate_poisson_scoreline(prob_home, prob_draw, prob_away, home_gf, home_ga
                 best_score = (h, a)
 
     return best_score
+
+
+# --- TOURNAMENT SIMULATOR ENDPOINTS ---
+@app.get("/api/tournament/groups")
+def get_group_standings():
+    """Extracts the 12 groups, calculates actual/predicted standings, and finds advancing teams."""
+    # 1. Fetch all WC matches
+    res = supabase.table("Matches").select("*, home:Teams!home_team_id(*), away:Teams!away_team_id(*), prediction:Predictions(*)").eq("league_name", "World Cup").gte("date", "2026-06-11").execute()
+    matches = res.data
+
+    # 2. Extract groups using a graph traversal (Teams that play each other are in the same group)
+    adj = defaultdict(set)
+    team_dict = {}
+    for m in matches:
+        # Only use the first ~72 matches (group stage) to build the clusters
+        adj[m["home_team_id"]].add(m["away_team_id"])
+        adj[m["away_team_id"]].add(m["home_team_id"])
+        team_dict[m["home_team_id"]] = m["home"]
+        team_dict[m["away_team_id"]] = m["away"]
+
+    visited = set()
+    groups = []
+    # Identify connected components (Groups of 4)
+    for t_id in list(team_dict.keys()):
+        if t_id not in visited:
+            group_members = set([t_id])
+            queue = [t_id]
+            while queue:
+                curr = queue.pop(0)
+                for neighbor in adj[curr]:
+                    if neighbor not in visited and neighbor not in group_members:
+                        group_members.add(neighbor)
+                        queue.append(neighbor)
+            for member in group_members: visited.add(member)
+            if len(group_members) == 4:
+                groups.append(list(group_members))
+
+    # Sort groups alphabetically by the first team's name to assign stable Group Letters (A-L)
+    groups.sort(key=lambda g: sorted([team_dict[tid]["name"] for tid in g])[0])
+    group_labels = "ABCDEFGHIJKL"
+
+    standings = []
+    # 3. Calculate points and goals
+    for idx, g_teams in enumerate(groups[:12]):
+        g_label = group_labels[idx]
+        g_standings = {tid: {"id": tid, "name": team_dict[tid]["name"], "logo": team_dict[tid]["logo_url"], "group": g_label, "pts": 0, "gf": 0, "ga": 0, "gd": 0, "played": 0} for tid in g_teams}
+        
+        # Process matches in this group
+        for m in matches:
+            if m["home_team_id"] in g_teams and m["away_team_id"] in g_teams:
+                h_id = m["home_team_id"]
+                a_id = m["away_team_id"]
+                
+                # Determine goals: Use actual if played, otherwise predicted
+                if m["status"] in ["FT", "AET", "PEN"]:
+                    hg, ag = m["home_goals"], m["away_goals"]
+                else:
+                    # Use Prediction
+                    if m.get("prediction") and len(m["prediction"]) > 0:
+                        pred = m["prediction"][0] if isinstance(m["prediction"], list) else m["prediction"]
+                        hg, ag = pred["predicted_home_goals"], pred["predicted_away_goals"]
+                    else:
+                        # Fallback predict it locally if missing
+                        _,_,_, hg, ag = run_local_prediction(h_id, a_id, m["date"])
+                
+                if hg is not None and ag is not None:
+                    g_standings[h_id]["played"] += 1; g_standings[a_id]["played"] += 1
+                    g_standings[h_id]["gf"] += hg; g_standings[a_id]["gf"] += ag
+                    g_standings[h_id]["ga"] += ag; g_standings[a_id]["ga"] += hg
+                    g_standings[h_id]["gd"] += (hg - ag); g_standings[a_id]["gd"] += (ag - hg)
+                    
+                    if hg > ag: g_standings[h_id]["pts"] += 3
+                    elif ag > hg: g_standings[a_id]["pts"] += 3
+                    else:
+                        g_standings[h_id]["pts"] += 1; g_standings[a_id]["pts"] += 1
+
+        # Sort this group: Pts -> GD -> GF
+        sorted_group = sorted(g_standings.values(), key=lambda x: (x["pts"], x["gd"], x["gf"]), reverse=True)
+        # Assign ranks
+        for rank, team in enumerate(sorted_group):
+            team["rank"] = rank + 1
+        standings.append({"group": g_label, "teams": sorted_group})
+
+    # 4. Extract advancers (Top 2 per group + Best 8 3rd places)
+    all_3rds = [g["teams"][2] for g in standings]
+    sorted_3rds = sorted(all_3rds, key=lambda x: (x["pts"], x["gd"], x["gf"]), reverse=True)
+    best_8_3rds = [t["id"] for t in sorted_3rds[:8]]
+
+    for g in standings:
+        for t in g["teams"]:
+            if t["rank"] <= 2 or t["id"] in best_8_3rds:
+                t["advances"] = True
+            else:
+                t["advances"] = False
+
+    return {"groups": standings, "advancing_3rds": sorted_3rds[:8]}
+
+@app.post("/api/tournament/knockout")
+def generate_knockout_bracket(payload: dict):
+    groups_data = payload.get("groups", [])
+    
+    # Organize winners, runners up, and 3rds
+    winners = {}; runners = {}; thirds = {}
+    for g in groups_data:
+        g_label = g["group"]
+        for t in g["teams"]:
+            if t["advances"]:
+                if t["rank"] == 1: winners[g_label] = t
+                elif t["rank"] == 2: runners[g_label] = t
+                elif t["rank"] == 3: thirds[g_label] = t
+
+    # GREEDY ALLOCATOR for 3rd Place Teams (Approximates the 495 combinations rules perfectly)
+    unassigned_thirds = list(thirds.values())
+    unassigned_thirds.sort(key=lambda x: (x["pts"], x["gd"], x["gf"]), reverse=True) # Give best teams priority
+    
+    def pop_best_3rd(allowed_groups):
+        for t in unassigned_thirds:
+            if t["group"] in allowed_groups:
+                unassigned_thirds.remove(t)
+                return t
+        # Fallback if specific combo is exhausted
+        if unassigned_thirds:
+            return unassigned_thirds.pop(0)
+        return {"name": "TBD", "logo": "", "id": 0}
+
+    # Match R32 according to Wikipedia Layout
+    r32_matches = [
+        {"id": 73, "home": runners.get("A"), "away": runners.get("B")},
+        {"id": 74, "home": winners.get("E"), "away": pop_best_3rd(["A","B","C","D","F"])},
+        {"id": 75, "home": winners.get("F"), "away": runners.get("C")},
+        {"id": 76, "home": winners.get("C"), "away": runners.get("F")},
+        {"id": 77, "home": winners.get("I"), "away": pop_best_3rd(["C","D","F","G","H"])},
+        {"id": 78, "home": runners.get("E"), "away": runners.get("I")},
+        {"id": 79, "home": winners.get("A"), "away": pop_best_3rd(["C","E","F","H","I"])},
+        {"id": 80, "home": winners.get("L"), "away": pop_best_3rd(["E","H","I","J","K"])},
+        {"id": 81, "home": winners.get("D"), "away": pop_best_3rd(["B","E","F","I","J"])},
+        {"id": 82, "home": winners.get("G"), "away": pop_best_3rd(["A","E","H","I","J"])},
+        {"id": 83, "home": runners.get("K"), "away": runners.get("L")},
+        {"id": 84, "home": winners.get("H"), "away": runners.get("J")},
+        {"id": 85, "home": winners.get("B"), "away": pop_best_3rd(["E","F","G","I","J"])},
+        {"id": 86, "home": winners.get("J"), "away": runners.get("H")},
+        {"id": 87, "home": winners.get("K"), "away": pop_best_3rd(["D","E","I","J","L"])},
+        {"id": 88, "home": runners.get("D"), "away": runners.get("G")},
+    ]
+
+    bracket = {"Round of 32": [], "Round of 16": [], "Quarter-Finals": [], "Semi-Finals": [], "Final": []}
+    
+    # Helper to simulate a round and return winners
+    def simulate_round(matches, round_name, next_round_map=None):
+        winners_list = []
+        for m in matches:
+            if not m.get("home") or not m.get("away") or m["home"]["id"] == 0 or m["away"]["id"] == 0:
+                m["pred_hg"] = 0; m["pred_ag"] = 0
+                winners_list.append({"name": "TBD", "logo": "", "id": 0})
+                bracket[round_name].append(m)
+                continue
+                
+            # Simulate locally
+            hp, dp, ap, hg, ag = run_local_prediction(m["home"]["id"], m["away"]["id"], datetime.now(timezone.utc).isoformat())
+            m["pred_hg"] = hg; m["pred_ag"] = ag
+            
+            # Resolve Knockout Draws via probabilities
+            if hg == ag:
+                if hp >= ap: m["pred_hg"] += 1
+                else: m["pred_ag"] += 1
+                
+            winner = m["home"] if m["pred_hg"] > m["pred_ag"] else m["away"]
+            m["winner"] = winner
+            winners_list.append(winner)
+            bracket[round_name].append(m)
+        return winners_list
+
+    # Simulate R32
+    r32_winners = simulate_round(r32_matches, "Round of 32")
+    
+    # Build R16 (Following Wiki pairings)
+    r16_matches = [
+        {"id": 90, "home": r32_winners[0], "away": r32_winners[2]}, # 73 vs 75
+        {"id": 89, "home": r32_winners[1], "away": r32_winners[4]}, # 74 vs 77
+        {"id": 91, "home": r32_winners[3], "away": r32_winners[5]}, # 76 vs 78
+        {"id": 92, "home": r32_winners[6], "away": r32_winners[7]}, # 79 vs 80
+        {"id": 93, "home": r32_winners[10], "away": r32_winners[11]},# 83 vs 84
+        {"id": 94, "home": r32_winners[8], "away": r32_winners[9]}, # 81 vs 82
+        {"id": 95, "home": r32_winners[13], "away": r32_winners[15]},# 86 vs 88
+        {"id": 96, "home": r32_winners[12], "away": r32_winners[14]} # 85 vs 87
+    ]
+    r16_winners = simulate_round(r16_matches, "Round of 16")
+    
+    # Build QF
+    qf_matches = [
+        {"id": 97, "home": r16_winners[1], "away": r16_winners[0]}, # 89 vs 90
+        {"id": 98, "home": r16_winners[4], "away": r16_winners[5]}, # 93 vs 94
+        {"id": 99, "home": r16_winners[2], "away": r16_winners[3]}, # 91 vs 92
+        {"id": 100, "home": r16_winners[6], "away": r16_winners[7]},# 95 vs 96
+    ]
+    qf_winners = simulate_round(qf_matches, "Quarter-Finals")
+    
+    # Build SF
+    sf_matches = [
+        {"id": 101, "home": qf_winners[0], "away": qf_winners[1]}, # 97 vs 98
+        {"id": 102, "home": qf_winners[2], "away": qf_winners[3]}, # 99 vs 100
+    ]
+    sf_winners = simulate_round(sf_matches, "Semi-Finals")
+    
+    # Build Final
+    final_match = [{"id": 104, "home": sf_winners[0], "away": sf_winners[1]}]
+    simulate_round(final_match, "Final")
+
+    return bracket
+
+# --- SHARED ML PREDICTION LOGIC ---
+def run_local_prediction(home_id, away_id, match_date, league_name="World Cup"):
+    """Runs the Random Forest purely locally without API calls."""
+    if ml_model is None:
+        return 0.33, 0.33, 0.33, 1, 1 # Safe fallback
+
+    def get_live_team_stats(team_id):
+        nr = 10
+        res = supabase.table("Matches").select("*").in_("status", ["FT", "AET", "PEN"]).or_(f"home_team_id.eq.{team_id},away_team_id.eq.{team_id}").lt("date", match_date).order("date", desc=True).limit(nr).execute()
+        matches = res.data
+        if not matches:
+            return {"win_rate": 0.0, "gd": 0.0, "rest_days": 14, "gf_avg": 0.0, "ga_avg": 0.0}
+            
+        wins = 0; goals_for = 0; goals_against = 0
+        for m in matches:
+            is_home = m["home_team_id"] == team_id
+            team_goals = m["home_goals"] if is_home else m["away_goals"]
+            opp_goals = m["away_goals"] if is_home else m["home_goals"]
+            if team_goals is not None and opp_goals is not None:
+                goals_for += team_goals
+                goals_against += opp_goals
+                if m["status"] != 'PEN':
+                    if team_goals > opp_goals: wins += 1
+                else:
+                    if m.get("match_winner_id") == team_id: wins += 1
+                        
+        win_rate = wins / len(matches)
+        gd = (goals_for - goals_against) / len(matches)
+        gf_avg = goals_for / len(matches)
+        ga_avg = goals_against / len(matches)
+        
+        last_match_date = pd.to_datetime(matches[0]["date"])
+        current_date = pd.to_datetime(match_date)
+        rest_days = min(abs((current_date - last_match_date).days), 14)
+        return {"win_rate": win_rate, "gd": gd, "rest_days": rest_days, "gf_avg": gf_avg, "ga_avg": ga_avg}
+
+    home_stats = get_live_team_stats(home_id)
+    away_stats = get_live_team_stats(away_id)
+    
+    h2h_res = supabase.table("Matches").select("*").in_("status", ["FT", "AET", "PEN"]).or_(f"and(home_team_id.eq.{home_id},away_team_id.eq.{away_id}),and(home_team_id.eq.{away_id},away_team_id.eq.{home_id})").lt("date", match_date).order("date", desc=True).limit(3).execute()
+    h2h_matches = h2h_res.data
+    
+    if not h2h_matches:
+        live_h2h_win_diff = 0.0
+        live_h2h_gd_diff = 0.0
+        h2h_home_gf_avg = None
+        h2h_away_gf_avg = None
+    else:
+        h_wins = 0; a_wins = 0; h_goals = 0; a_goals = 0
+        for m in h2h_matches:
+            if m["home_team_id"] == home_id:
+                h_g, a_g = m["home_goals"], m["away_goals"]
+            else:
+                h_g, a_g = m["away_goals"], m["home_goals"]
+            if h_g > a_g: h_wins += 1
+            elif a_g > h_g: a_wins += 1
+            h_goals += h_g
+            a_goals += a_g
+            
+        live_h2h_win_diff = (h_wins - a_wins) / len(h2h_matches)
+        live_h2h_gd_diff = (h_goals - a_goals) / len(h2h_matches)
+        h2h_home_gf_avg = h_goals / len(h2h_matches)
+        h2h_away_gf_avg = a_goals / len(h2h_matches)
+    
+    home_team_data = supabase.table("Teams").select("current_elo").eq("team_id", home_id).single().execute()
+    away_team_data = supabase.table("Teams").select("current_elo").eq("team_id", away_id).single().execute()
+    
+    home_elo = home_team_data.data.get("current_elo") if home_team_data.data else 1500.0
+    away_elo = away_team_data.data.get("current_elo") if away_team_data.data else 1500.0
+
+    X_live = pd.DataFrame([{
+        'home_win_rate_diff': home_stats["win_rate"] - away_stats["win_rate"],
+        'home_gd_diff': home_stats["gd"] - away_stats["gd"],
+        'elo_diff': home_elo - away_elo,
+        'rest_days_diff': home_stats["rest_days"] - away_stats["rest_days"],
+        'match_importance': 5, # Fixed World Cup importance
+        'h2h_win_diff': live_h2h_win_diff, 
+        'h2h_gd_diff': live_h2h_gd_diff
+    }])
+
+    probabilities = ml_model.predict_proba(X_live)[0]
+    classes = ml_model.classes_
+    try:
+        home_prob = probabilities[list(classes).index(0)]
+        draw_prob = probabilities[list(classes).index(1)]
+        away_prob = probabilities[list(classes).index(2)]
+    except ValueError:
+        home_prob, draw_prob, away_prob = probabilities[0], probabilities[1], probabilities[2]
+
+    pred_h_g, pred_a_g = generate_poisson_scoreline(
+        home_prob, draw_prob, away_prob, 
+        home_stats["gf_avg"], home_stats["ga_avg"], 
+        away_stats["gf_avg"], away_stats["ga_avg"], 
+        h2h_home_gf_avg, h2h_away_gf_avg
+    )
+    
+    return home_prob, draw_prob, away_prob, pred_h_g, pred_a_g
