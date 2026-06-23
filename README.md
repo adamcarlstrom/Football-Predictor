@@ -6,6 +6,19 @@ Motivated by a bracket-prediction competition with friends and family during the
 
 Rather than relying on basic score guessing, this application is a fully autonomous, full-stack Machine Learning platform. It ingests historical international match data, trains a Random Forest model, calculates Expected Goals (xG) using a Poisson distribution, and deterministically maps out the entire 48-team tournament bracket based on strict FIFA regulations.
 
+## 📸 Project Showcase
+### The Live Dashboard
+![Dashboard View1](./assets/DailyPredict1.png)
+![Dashboard View2](./assets/DailyPredict2.png)
+![Dashboard View3](./assets/DailyPredict3.png)
+
+### The Knockout Bracket Simulator
+![Bracket View_Group](./assets/GroupStage.png)
+![Bracket View_Knockout](./assets/Knockout.png)
+
+### Database Schema
+![Database_Schema](./assets/DatabaseSchema.png)
+
 ## Core Features
 
 * Machine Learning Predictions: Predicts match outcomes (Win/Draw/Loss) using historical Elo ratings, 10-game form, rest days, and Head-to-Head (H2H) records.
