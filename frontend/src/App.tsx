@@ -190,7 +190,7 @@ export default function App() {
   );
 
   const renderTournamentPredictor = () => (
-    <div>
+    <div style={{width: "100%"}}>
       <div style={{ textAlign: 'center', marginBottom: '30px' }}>
         <button onClick={handleSimulateGroups} disabled={isSimulatingGroups} style={{ padding: '15px 30px', backgroundColor: '#8e44ad', color: 'white', border: 'none', borderRadius: '8px', cursor: 'pointer', fontWeight: 'bold', fontSize: '16px' }}>
           {isSimulatingGroups ? 'Running Local ML Simulation...' : '1. Predict Full Group Stage'}
@@ -283,7 +283,7 @@ export default function App() {
         </div>
       </div>
       
-      <div style={{ maxWidth: '1200px', margin: '0 auto' }}>
+      <div style={{ maxWidth: '90vw', margin: '0 auto' }}>
         {activeTab === 'daily' ? renderDailyFeed() : renderTournamentPredictor()}
       </div>
     </div>
