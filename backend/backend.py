@@ -233,7 +233,7 @@ def fetch_and_predict(match_id: int):
     home_elo = home_team_data.data.get("current_elo") or 1500.0
     away_elo = away_team_data.data.get("current_elo") or 1500.0
 
-    # Construct the 5 features exactly as the model expects them
+    # Construct the 7 features exactly as the model expects them
     home_gf = home_stats["gf_avg"]
     home_ga = home_stats["ga_avg"]
     away_gf = away_stats["gf_avg"]

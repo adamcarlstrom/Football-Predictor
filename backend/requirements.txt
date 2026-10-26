@@ -4,3 +4,6 @@ supabase
 requests
 pandas
 python-dotenv
+joblib
+# Pinned to the version that pickled match_predictor.joblib; unpickling a RandomForest with a different version can fail
+scikit-learn==1.9.0

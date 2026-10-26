@@ -55,10 +55,12 @@ This repository is organized into three main modules. Detailed technical documen
 
 ### Quick Start
 
-Clone the repository: ```git clone https://github.com/yourusername/football-predictor.git```
+Clone the repository: `git clone https://github.com/adamcarlstrom/Football-Predictor.git`
 
-Set up your ```.env file with your SUPABASE_URL, SUPABASE_KEY, and FOOTBALL_API_KEY.```
+Install the Python dependencies (covers both the backend and the ML pipeline): `python -m venv .venv && source .venv/bin/activate && pip install -r backend/requirements.txt`
 
-Start the backend: ```cd backend && uvicorn backend:app --reload```
+Set up a `.env` file in both `backend/` and `ml_pipeline/` containing `SUPABASE_URL`, `SUPABASE_KEY`, and `FOOTBALL_API_KEY`. (A single `.env` at the repository root also works, since `python-dotenv` searches upward from each script's folder, but a module-level file takes precedence.)
 
-Start the frontend: ```cd frontend && npm run dev```
+Start the backend: `cd backend && uvicorn backend:app --reload`
+
+Start the frontend: `cd frontend && npm install && npm run dev`
